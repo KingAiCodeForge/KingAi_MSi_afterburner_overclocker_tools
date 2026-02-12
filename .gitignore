@@ -1,0 +1,28 @@
+# Ignore private research, test outputs, and local configs
+ignore/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Logs (keep the ignore/ dir itself via plan.md)
+*.log
