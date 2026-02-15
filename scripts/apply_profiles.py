@@ -26,6 +26,38 @@ import sys
 import tempfile
 from datetime import datetime
 
+
+# ── Logging tee ─────────────────────────────────────────────────────────────
+class _Tee:
+    """Write to both a file and the original stream."""
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _init_log(script_name: str):
+    """Set up file logging. Returns the log file path."""
+    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(logs_dir, f"{script_name}_{stamp}.log")
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+    return log_path
+
+
 # ── Constants ───────────────────────────────────────────────────────────────
 AB_PROFILES_DIR = r"C:\Program Files (x86)\MSI Afterburner\Profiles"
 
@@ -118,7 +150,10 @@ def main() -> None:
                         help="Preview changes without writing any files.")
     args = parser.parse_args()
 
+    log_path = _init_log("apply_profiles")
+
     cfg_path = find_config(args.config)
+    print(f"{ts()} Log file: {log_path}")
     print(f"{ts()} Config: {os.path.basename(cfg_path)}")
     print(f"{ts()} Full path: {cfg_path}")
     print()
@@ -237,6 +272,39 @@ def main() -> None:
         else:
             print(f"{ts()} ERROR: Elevated copy failed. Copy manually:")
             print(f'{ts()}   copy "{temp_path}" "{cfg_path}"')
+
+    # ── Fix top-level ProfileN.cfg files ───────────────────────────────────
+    # Afterburner checks these first. If they say ProfileContents=1, the
+    # profile is treated as empty and OC settings in the per-GPU config are
+    # ignored. They MUST say ProfileContents=3 for OC data to be loaded.
+    print(f"{ts()} Updating top-level ProfileN.cfg files...")
+    profiles_dir = os.path.dirname(cfg_path)
+    for pname, _, _ in PROFILES:
+        top_cfg = os.path.join(profiles_dir, f"{pname}.cfg")
+        desired = "[Settings]\r\nProfileContents=3\r\n"
+        needs_update = True
+        if os.path.isfile(top_cfg):
+            with open(top_cfg, "r", encoding="ascii", errors="replace") as f:
+                existing = f.read()
+            if "ProfileContents=3" in existing:
+                needs_update = False
+        if needs_update:
+            temp_top = os.path.join(temp_dir, f"{pname}.cfg")
+            with open(temp_top, "w", encoding="ascii", newline="\r\n") as f:
+                f.write(desired)
+            try:
+                shutil.copy2(temp_top, top_cfg)
+                print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (direct)")
+            except PermissionError:
+                ps_cmd = f"Copy-Item '{temp_top}' '{top_cfg}' -Force"
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f"Start-Process powershell -Verb RunAs -ArgumentList '-Command',\"{ps_cmd}\" -Wait"],
+                    capture_output=True, text=True, timeout=15
+                )
+                print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (elevated)")
+        else:
+            print(f"{ts()}   {pname}.cfg -> already OK")
 
     print()
     print(f"{ts()} Profile layout:")

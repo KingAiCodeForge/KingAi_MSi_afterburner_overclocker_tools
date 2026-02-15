@@ -20,6 +20,40 @@ import struct
 import sys
 from datetime import datetime
 
+
+# ── Logging tee ─────────────────────────────────────────────────────────────
+# Duplicates all print() output to both console and a timestamped log file.
+class _Tee:
+    """Write to both a file and the original stream."""
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    # Pass through any other attribute to the original stream
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _init_log(script_name: str):
+    """Set up file logging. Returns the log file path."""
+    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(logs_dir, f"{script_name}_{stamp}.log")
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+    return log_path
+
+
 # ── Constants ───────────────────────────────────────────────────────────────
 AB_PROFILES_DIR = r"C:\Program Files (x86)\MSI Afterburner\Profiles"
 HEADER_BYTES = 8          # uint32 version + uint32 count
@@ -196,7 +230,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    log_path = _init_log("decode_vf_curve")
+
     cfg_path = find_config(args.config)
+    print(f"{ts()} Log file: {log_path}")
     print(f"{ts()} Reading config: {os.path.basename(cfg_path)}")
     print(f"{ts()} Full path: {cfg_path}")
     print()
