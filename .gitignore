@@ -24,6 +24,10 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# Tests
+test_*.py
+tests/
+
 # Logs (keep the ignore/ dir itself via plan.md)
 *.log
 logs/

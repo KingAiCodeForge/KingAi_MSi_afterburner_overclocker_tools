@@ -9,7 +9,7 @@ Compatible with NVIDIA GTX 10-series (Pascal) and newer.
 
 Usage:
     python decode_vf_curve.py
-    python decode_vf_curve.py --config "C:\\path\\to\\custom.cfg"
+    python decode_vf_curve.py --config "path/to/custom.cfg"
     python decode_vf_curve.py --all       # Show every point, not just inflections
 """
 
@@ -55,7 +55,13 @@ def _init_log(script_name: str):
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
-AB_PROFILES_DIR = r"C:\Program Files (x86)\MSI Afterburner\Profiles"
+AB_PROFILES_DIR = os.environ.get(
+    "AB_PROFILES_DIR",
+    os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "MSI Afterburner", "Profiles",
+    ),
+)
 HEADER_BYTES = 8          # uint32 version + uint32 count
 BYTES_PER_POINT = 12      # 3 x float32
 HEX_PER_POINT = 24        # 12 bytes * 2

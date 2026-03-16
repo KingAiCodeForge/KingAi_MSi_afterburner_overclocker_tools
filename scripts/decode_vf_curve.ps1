@@ -7,7 +7,7 @@
 #
 # Usage:
 #     .\decode_vf_curve.ps1
-#     .\decode_vf_curve.ps1 -ConfigPath "C:\path\to\custom.cfg"
+#     .\decode_vf_curve.ps1 -ConfigPath "path\to\custom.cfg"
 #     .\decode_vf_curve.ps1 -ShowAll
 
 param(
@@ -16,7 +16,9 @@ param(
 )
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AB_PROFILES_DIR = "C:\Program Files (x86)\MSI Afterburner\Profiles"
+$_PFx86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+if (-not $_PFx86) { $_PFx86 = "C:\Program Files (x86)" }
+$AB_PROFILES_DIR = if ($env:AB_PROFILES_DIR) { $env:AB_PROFILES_DIR } else { Join-Path $_PFx86 "MSI Afterburner\Profiles" }
 $HEX_PER_POINT  = 24       # 12 bytes * 2 hex chars
 $HEADER_HEX_LEN = 16       # 8 bytes * 2 hex chars
 $SECTIONS = @("Startup","Profile1","Profile2","Profile3","Profile4","Profile5")

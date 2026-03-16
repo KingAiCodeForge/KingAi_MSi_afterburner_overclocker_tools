@@ -8,7 +8,7 @@
 # Usage:
 #     .\apply_profiles.ps1                  # Apply and copy
 #     .\apply_profiles.ps1 -DryRun          # Preview without writing
-#     .\apply_profiles.ps1 -ConfigPath "C:\path\to\custom.cfg"
+#     .\apply_profiles.ps1 -ConfigPath "path\to\custom.cfg"
 
 param(
     [string]$ConfigPath,
@@ -16,7 +16,9 @@ param(
 )
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AB_PROFILES_DIR = "C:\Program Files (x86)\MSI Afterburner\Profiles"
+$_PFx86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+if (-not $_PFx86) { $_PFx86 = "C:\Program Files (x86)" }
+$AB_PROFILES_DIR = if ($env:AB_PROFILES_DIR) { $env:AB_PROFILES_DIR } else { "$_PFx86\MSI Afterburner\Profiles" }
 
 # Tiered profiles: name, mem_kHz, fan_%
 $PROFILES = @(
@@ -174,6 +176,45 @@ try {
     } else {
         Write-Host "$(TS) WARNING: Copy may have failed. Manual copy:"
         Write-Host "$(TS)   Copy-Item '$tempPath' '$cfgPath' -Force"
+    }
+}
+
+# ── Fix top-level ProfileN.cfg files ──────────────────────────────────────────
+# Afterburner checks these first. If they say ProfileContents=1 (or 0), the
+# profile is treated as monitoring-only and OC settings in the per-GPU config
+# are silently ignored. They MUST say ProfileContents=3 for OC data to load.
+# Uses read-modify-write to preserve ~27KB of monitoring/OSD config.
+Write-Host "$(TS) Updating top-level ProfileN.cfg files..."
+$profilesDir = Split-Path $cfgPath -Parent
+foreach ($prof in $PROFILES) {
+    $pName = $prof.Name
+    $topCfg = Join-Path $profilesDir "$pName.cfg"
+
+    if (Test-Path $topCfg) {
+        $existing = [System.IO.File]::ReadAllText($topCfg, [System.Text.Encoding]::ASCII)
+        if ($existing -match "ProfileContents=3") {
+            Write-Host "$(TS)   $pName.cfg -> already OK"
+            continue
+        }
+        # Read-modify-write: patch only the ProfileContents line
+        if ($existing -match "ProfileContents=\d+") {
+            $patched = $existing -replace "ProfileContents=\d+", "ProfileContents=3"
+        } else {
+            $patched = $existing -replace "\[Settings\]\r?\n", "[Settings]`r`nProfileContents=3`r`n"
+        }
+    } else {
+        $patched = "[Settings]`r`nProfileContents=3`r`n"
+    }
+
+    $tempTop = Join-Path $env:TEMP "$pName.cfg"
+    [System.IO.File]::WriteAllText($tempTop, $patched, [System.Text.Encoding]::ASCII)
+    try {
+        Copy-Item $tempTop $topCfg -Force -ErrorAction Stop
+        Write-Host "$(TS)   $pName.cfg -> ProfileContents=3 (direct)"
+    } catch {
+        $psCmd2 = "Copy-Item '$tempTop' '$topCfg' -Force"
+        Start-Process powershell -Verb RunAs -ArgumentList "-Command",$psCmd2 -Wait
+        Write-Host "$(TS)   $pName.cfg -> ProfileContents=3 (elevated)"
     }
 }
 

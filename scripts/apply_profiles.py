@@ -59,7 +59,13 @@ def _init_log(script_name: str):
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
-AB_PROFILES_DIR = r"C:\Program Files (x86)\MSI Afterburner\Profiles"
+AB_PROFILES_DIR = os.environ.get(
+    "AB_PROFILES_DIR",
+    os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "MSI Afterburner", "Profiles",
+    ),
+)
 
 # Tiered profile definitions: (name, mem_offset_kHz, fan_pct)
 # Memory values in kHz (Afterburner's internal unit). Divide by 1000 for MHz.
@@ -277,34 +283,41 @@ def main() -> None:
     # Afterburner checks these first. If they say ProfileContents=1, the
     # profile is treated as empty and OC settings in the per-GPU config are
     # ignored. They MUST say ProfileContents=3 for OC data to be loaded.
+    # Uses read-modify-write to preserve ~27KB of monitoring/OSD config.
     print(f"{ts()} Updating top-level ProfileN.cfg files...")
     profiles_dir = os.path.dirname(cfg_path)
     for pname, _, _ in PROFILES:
         top_cfg = os.path.join(profiles_dir, f"{pname}.cfg")
-        desired = "[Settings]\r\nProfileContents=3\r\n"
-        needs_update = True
         if os.path.isfile(top_cfg):
             with open(top_cfg, "r", encoding="ascii", errors="replace") as f:
                 existing = f.read()
             if "ProfileContents=3" in existing:
-                needs_update = False
-        if needs_update:
-            temp_top = os.path.join(temp_dir, f"{pname}.cfg")
-            with open(temp_top, "w", encoding="ascii", newline="\r\n") as f:
-                f.write(desired)
-            try:
-                shutil.copy2(temp_top, top_cfg)
-                print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (direct)")
-            except PermissionError:
-                ps_cmd = f"Copy-Item '{temp_top}' '{top_cfg}' -Force"
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f"Start-Process powershell -Verb RunAs -ArgumentList '-Command',\"{ps_cmd}\" -Wait"],
-                    capture_output=True, text=True, timeout=15
-                )
-                print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (elevated)")
+                print(f"{ts()}   {pname}.cfg -> already OK")
+                continue
+            # Read-modify-write: patch only the ProfileContents line
+            if re.search(r"^ProfileContents=\d+", existing, re.MULTILINE):
+                patched = re.sub(r"^ProfileContents=\d+", "ProfileContents=3", existing, count=1, flags=re.MULTILINE)
+            else:
+                patched = existing.replace("[Settings]\r\n", "[Settings]\r\nProfileContents=3\r\n", 1)
+                if patched == existing:
+                    patched = existing.replace("[Settings]\n", "[Settings]\nProfileContents=3\n", 1)
         else:
-            print(f"{ts()}   {pname}.cfg -> already OK")
+            patched = "[Settings]\r\nProfileContents=3\r\n"
+
+        temp_top = os.path.join(temp_dir, f"{pname}.cfg")
+        with open(temp_top, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
+            f.write(patched)
+        try:
+            shutil.copy2(temp_top, top_cfg)
+            print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (direct)")
+        except PermissionError:
+            ps_cmd = f"Copy-Item '{temp_top}' '{top_cfg}' -Force"
+            subprocess.run(
+                ["powershell", "-Command",
+                 f"Start-Process powershell -Verb RunAs -ArgumentList '-Command',\"{ps_cmd}\" -Wait"],
+                capture_output=True, text=True, timeout=15
+            )
+            print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (elevated)")
 
     print()
     print(f"{ts()} Profile layout:")
