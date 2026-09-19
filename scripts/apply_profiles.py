@@ -1,331 +1,422 @@
 #!/usr/bin/env python3
-"""
-Apply tiered overclock profiles to MSI Afterburner config.
+"""Plan or execute a guarded, offline edit of Afterburner profile files."""
 
-Copies the VF curve from Startup to all 5 profile slots and sets per-profile
-memory clock offsets and fan speeds. Writes config to a temp location first,
-then copies to Program Files via admin elevation.
-
-Compatible with NVIDIA GTX 10-series (Pascal) and newer.
-
-Usage:
-    python apply_profiles.py --dry-run    # Preview without writing
-    python apply_profiles.py              # Apply and copy
-    python apply_profiles.py --config "path/to/custom.cfg"
-"""
+from __future__ import annotations
 
 import argparse
-import ctypes
-import glob
-import os
-import re
-import shutil
-import struct
-import subprocess
+import json
 import sys
-import tempfile
-from datetime import datetime
+from pathlib import Path
 
-
-# ── Logging tee ─────────────────────────────────────────────────────────────
-class _Tee:
-    """Write to both a file and the original stream."""
-    def __init__(self, stream, log_file):
-        self._stream = stream
-        self._log = log_file
-
-    def write(self, data):
-        self._stream.write(data)
-        self._log.write(data)
-
-    def flush(self):
-        self._stream.flush()
-        self._log.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-
-def _init_log(script_name: str):
-    """Set up file logging. Returns the log file path."""
-    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(logs_dir, f"{script_name}_{stamp}.log")
-    log_file = open(log_path, "w", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, log_file)
-    sys.stderr = _Tee(sys.__stderr__, log_file)
-    return log_path
-
-
-# ── Constants ───────────────────────────────────────────────────────────────
-AB_PROFILES_DIR = os.environ.get(
-    "AB_PROFILES_DIR",
-    os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        "MSI Afterburner", "Profiles",
-    ),
+from profile_safety import (
+    PROFILE_NAMES,
+    PlannedWrite,
+    SafetyError,
+    TransactionError,
+    ascii_bytes,
+    atomic_write_transaction,
+    get_ini_value,
+    get_section,
+    patch_profile_contents,
+    replace_section,
+    resolve_config,
+    set_ini_value,
+    sha256_bytes,
+    validate_profile_name,
+    validate_settings,
+    validate_vf_hex,
 )
-
-# Tiered profile definitions: (name, mem_offset_kHz, fan_pct)
-# Memory values in kHz (Afterburner's internal unit). Divide by 1000 for MHz.
-PROFILES = [
-    ("Profile1", 500000,  50),   # +500 MHz mem, 50% fan
-    ("Profile2", 600000,  55),   # +600 MHz mem, 55% fan
-    ("Profile3", 700000,  60),   # +700 MHz mem, 60% fan
-    ("Profile4", 800000,  70),   # +800 MHz mem, 70% fan
-    ("Profile5", 900000,  80),   # +900 MHz mem, 80% fan
-]
+from vf_curve_format import VFPoint, decode_vf_curve, encode_vf_curve
 
 
-def ts() -> str:
-    return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+EXAMPLE_MEMORY_MHZ = (0, 0, 0, 0, 0)
+EXAMPLE_FAN_PERCENT = (50, 55, 60, 65, 70)
 
 
-def find_config(custom_path: str | None = None) -> str:
-    if custom_path:
-        if not os.path.isfile(custom_path):
-            print(f"{ts()} ERROR: Config not found: {custom_path}", file=sys.stderr)
-            sys.exit(1)
-        return custom_path
+def _project_effective_curve(
+    source_hex: str,
+    target_reference_hex: str,
+) -> tuple[str, dict[str, int | float]]:
+    """Represent the source effective curve using only target offset edits."""
 
-    pattern = os.path.join(AB_PROFILES_DIR, "VEN_10DE*.cfg")
-    matches = glob.glob(pattern)
-    if not matches:
-        print(f"{ts()} ERROR: No NVIDIA config found in {AB_PROFILES_DIR}", file=sys.stderr)
-        sys.exit(1)
-
-    best = max(matches, key=os.path.getsize)
-    if len(matches) > 1:
-        print(f"{ts()} Found {len(matches)} GPU configs, using largest: {os.path.basename(best)}")
-    return best
-
-
-def set_ini_value(block: str, key: str, value: str) -> str:
-    """Set a key=value in an INI section block. Adds the key if not present."""
-    pattern = re.compile(rf"^({re.escape(key)})=.*$", re.MULTILINE)
-    if pattern.search(block):
-        return pattern.sub(f"{key}={value}", block, count=1)
-    else:
-        # Add after Format= line if present, otherwise at the end
-        format_match = re.search(r"^Format=.*$", block, re.MULTILINE)
-        if format_match:
-            insert_pos = format_match.end()
-            return block[:insert_pos] + f"\n{key}={value}" + block[insert_pos:]
-        return block.rstrip("\n") + f"\n{key}={value}\n"
-
-
-def get_ini_value(block: str, key: str) -> str | None:
-    match = re.search(rf"^{re.escape(key)}=(.+)$", block, re.MULTILINE)
-    return match.group(1).strip() if match else None
-
-
-def parse_sections(text: str) -> list[tuple[str, str, str]]:
-    """
-    Parse config into list of (section_header_line, section_name, section_body).
-    Preserves exact original formatting.
-    """
-    parts = []
-    current_name = None
-    current_header = None
-    lines = []
-
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if current_name is not None:
-                parts.append((current_header, current_name, "".join(lines)))
-            current_name = stripped[1:-1]
-            current_header = line
-            lines = []
-        else:
-            lines.append(line)
-
-    if current_name is not None:
-        parts.append((current_header, current_name, "".join(lines)))
-
-    return parts
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Apply tiered OC profiles to MSI Afterburner config."
-    )
-    parser.add_argument("--config", "-c", help="Path to a specific .cfg file.")
-    parser.add_argument("--dry-run", "-n", action="store_true",
-                        help="Preview changes without writing any files.")
-    args = parser.parse_args()
-
-    log_path = _init_log("apply_profiles")
-
-    cfg_path = find_config(args.config)
-    print(f"{ts()} Log file: {log_path}")
-    print(f"{ts()} Config: {os.path.basename(cfg_path)}")
-    print(f"{ts()} Full path: {cfg_path}")
-    print()
-
-    if args.dry_run:
-        print(f"{ts()} DRY RUN — no files will be modified")
-        print()
-
-    # Read config
-    with open(cfg_path, "r", encoding="ascii", errors="replace") as f:
-        text = f.read()
-
-    # Parse into sections
-    sections = parse_sections(text)
-    section_map = {name: body for _, name, body in sections}
-
-    # Get VF curve from Startup
-    startup_body = section_map.get("Startup", "")
-    vf_match = re.search(r"VFCurve=([0-9A-Fa-f]+)", startup_body)
-    if not vf_match:
-        print(f"{ts()} ERROR: No VFCurve found in [Startup] section.", file=sys.stderr)
-        print(f"{ts()} Set up your undervolt in Afterburner first, then run this.", file=sys.stderr)
-        sys.exit(1)
-
-    vf_hex = vf_match.group(1)
-    print(f"{ts()} Source VF curve from [Startup]: {len(vf_hex)} hex chars")
-
-    # Get Startup's CoreClkBoost for reference
-    startup_core = get_ini_value(startup_body, "CoreClkBoost") or "0"
-    print(f"{ts()} Startup CoreClkBoost: {int(startup_core) / 1000:.0f} MHz")
-    print()
-
-    # Build modified config
-    new_sections = []
-    for header, name, body in sections:
-        # Find matching profile definition
-        profile_def = next((p for p in PROFILES if p[0] == name), None)
-
-        if profile_def:
-            pname, mem_khz, fan_pct = profile_def
-            body = set_ini_value(body, "CoreClkBoost", startup_core)
-            body = set_ini_value(body, "MemClkBoost", str(mem_khz))
-            body = set_ini_value(body, "FanMode", "1")
-            body = set_ini_value(body, "FanSpeed", str(fan_pct))
-            body = set_ini_value(body, "VFCurve", vf_hex)
-            # Preserve existing power/thermal or set safe defaults
-            if not get_ini_value(body, "PowerLimit"):
-                body = set_ini_value(body, "PowerLimit", "100")
-            if not get_ini_value(body, "ThermalLimit"):
-                body = set_ini_value(body, "ThermalLimit", "83")
-
-            print(f"{ts()} {pname} -> Core: {int(startup_core)/1000:.0f} MHz | "
-                  f"Mem: +{mem_khz/1000:.0f} MHz | Fan: {fan_pct}% | VF: Startup curve")
-
-        new_sections.append(header + body)
-
-    print()
-
-    if args.dry_run:
-        print(f"{ts()} DRY RUN complete. No files modified.")
-        return
-
-    # Reassemble config content
-    content = "".join(new_sections)
-
-    # Write to temp location (writable without admin)
-    temp_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
-    temp_path = os.path.join(temp_dir, "AB_profile_modified.cfg")
-
-    # Write as ASCII with no BOM — critical for Afterburner compatibility
-    with open(temp_path, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
-        f.write(content)
-
-    # Verify no BOM
-    with open(temp_path, "rb") as f:
-        first3 = f.read(3)
-    if first3 == b"\xef\xbb\xbf":
-        print(f"{ts()} WARNING: BOM detected in output, stripping...")
-        with open(temp_path, "rb") as f:
-            data = f.read()
-        with open(temp_path, "wb") as f:
-            f.write(data[3:])
-
-    file_size = os.path.getsize(temp_path)
-    print(f"{ts()} Written to: {temp_path} ({file_size} bytes, ASCII, no BOM)")
-
-    # Backup original
-    backup_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(temp_dir, f"AB_profile_backup_{backup_suffix}.cfg")
-    shutil.copy2(cfg_path, backup_path)
-    print(f"{ts()} Backup saved: {backup_path}")
-
-    # Copy to Afterburner profiles dir (needs admin)
-    print(f"{ts()} Copying to Afterburner profile dir (admin required)...")
-    try:
-        # Try direct copy first (works if running as admin)
-        shutil.copy2(temp_path, cfg_path)
-        print(f"{ts()} SUCCESS: Config updated directly.")
-    except PermissionError:
-        # Elevate via PowerShell
-        ps_cmd = f"Copy-Item '{temp_path}' '{cfg_path}' -Force; Start-Sleep 1"
-        result = subprocess.run(
-            ["powershell", "-Command",
-             f"Start-Process powershell -Verb RunAs -ArgumentList '-Command',\"{ps_cmd}\" -Wait"],
-            capture_output=True, text=True, timeout=30
+    source_curve = decode_vf_curve(source_hex)
+    target_curve = decode_vf_curve(target_reference_hex)
+    if source_curve.point_count != target_curve.point_count:
+        raise SafetyError(
+            "Source and target VFCurve point counts differ; refusing to "
+            "replace target structural data."
         )
-        if result.returncode == 0:
-            # Verify the copy worked
-            live_size = os.path.getsize(cfg_path)
-            with open(cfg_path, "rb") as f:
-                first_byte = f.read(1)
-            if first_byte == b"[":
-                print(f"{ts()} SUCCESS: Config updated ({live_size} bytes, clean encoding).")
-            else:
-                print(f"{ts()} WARNING: File copied but encoding may be wrong. Check Afterburner.")
-        else:
-            print(f"{ts()} ERROR: Elevated copy failed. Copy manually:")
-            print(f'{ts()}   copy "{temp_path}" "{cfg_path}"')
 
-    # ── Fix top-level ProfileN.cfg files ───────────────────────────────────
-    # Afterburner checks these first. If they say ProfileContents=1, the
-    # profile is treated as empty and OC settings in the per-GPU config are
-    # ignored. They MUST say ProfileContents=3 for OC data to be loaded.
-    # Uses read-modify-write to preserve ~27KB of monitoring/OSD config.
-    print(f"{ts()} Updating top-level ProfileN.cfg files...")
-    profiles_dir = os.path.dirname(cfg_path)
-    for pname, _, _ in PROFILES:
-        top_cfg = os.path.join(profiles_dir, f"{pname}.cfg")
-        if os.path.isfile(top_cfg):
-            with open(top_cfg, "r", encoding="ascii", errors="replace") as f:
-                existing = f.read()
-            if "ProfileContents=3" in existing:
-                print(f"{ts()}   {pname}.cfg -> already OK")
-                continue
-            # Read-modify-write: patch only the ProfileContents line
-            if re.search(r"^ProfileContents=\d+", existing, re.MULTILINE):
-                patched = re.sub(r"^ProfileContents=\d+", "ProfileContents=3", existing, count=1, flags=re.MULTILINE)
-            else:
-                patched = existing.replace("[Settings]\r\n", "[Settings]\r\nProfileContents=3\r\n", 1)
-                if patched == existing:
-                    patched = existing.replace("[Settings]\n", "[Settings]\nProfileContents=3\n", 1)
-        else:
-            patched = "[Settings]\r\nProfileContents=3\r\n"
-
-        temp_top = os.path.join(temp_dir, f"{pname}.cfg")
-        with open(temp_top, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
-            f.write(patched)
-        try:
-            shutil.copy2(temp_top, top_cfg)
-            print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (direct)")
-        except PermissionError:
-            ps_cmd = f"Copy-Item '{temp_top}' '{top_cfg}' -Force"
-            subprocess.run(
-                ["powershell", "-Command",
-                 f"Start-Process powershell -Verb RunAs -ArgumentList '-Command',\"{ps_cmd}\" -Wait"],
-                capture_output=True, text=True, timeout=15
+    projected: list[VFPoint] = []
+    for source_point, target_point in zip(source_curve.points, target_curve.points):
+        if abs(source_point.voltage_mv - target_point.voltage_mv) > 0.01:
+            raise SafetyError(
+                "Source and target VFCurve voltage grids differ at point "
+                f"{target_point.index}: {source_point.voltage_mv} vs "
+                f"{target_point.voltage_mv} mV."
             )
-            print(f"{ts()}   {pname}.cfg -> ProfileContents=3 (elevated)")
+        projected.append(
+            VFPoint(
+                index=target_point.index,
+                voltage_mv=target_point.voltage_mv,
+                base_frequency_mhz=target_point.base_frequency_mhz,
+                offset_mhz=(
+                    source_point.effective_frequency_mhz
+                    - target_point.base_frequency_mhz
+                ),
+            )
+        )
 
-    print()
-    print(f"{ts()} Profile layout:")
-    for pname, mem_khz, fan_pct in PROFILES:
-        print(f"{ts()}   {pname}: Core {int(startup_core)/1000:.0f} (VF curve) | Mem +{mem_khz/1000:.0f} MHz | Fan {fan_pct}%")
-    print()
-    print(f"{ts()} Restart MSI Afterburner to apply changes.")
+    replacement_hex = encode_vf_curve(target_curve, projected)
+    summary = validate_vf_hex(
+        replacement_hex,
+        reference_hex=target_reference_hex,
+    )
+    return replacement_hex, summary
+
+
+def _integer_value(block: str, key: str, default: int | None = None) -> int:
+    raw = get_ini_value(block, key)
+    if raw is None:
+        if default is None:
+            raise SafetyError(f"Missing required {key} value.")
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SafetyError(f"{key} must be an integer, got {raw!r}.") from exc
+
+
+def build_plan(args: argparse.Namespace) -> tuple[dict, list[PlannedWrite]]:
+    cfg_path = resolve_config(gpu_id=args.gpu_id, config_path=args.config)
+    profiles_dir = cfg_path.parent
+    selected = [validate_profile_name(item) for item in args.profile]
+    if len(set(selected)) != len(selected):
+        raise SafetyError("Each --profile may be selected only once.")
+    memory_values = args.memory if args.memory is not None else list(EXAMPLE_MEMORY_MHZ)
+    fan_values = args.fan if args.fan is not None else list(EXAMPLE_FAN_PERCENT)
+    power = args.power if args.power is not None else 100
+    thermal = args.thermal if args.thermal is not None else 83
+
+    config_original = cfg_path.read_bytes()
+    text = config_original.decode("ascii", errors="strict")
+    source_name = args.source_profile
+    source = get_section(text, source_name)
+    vf_hex = get_ini_value(source, "VFCurve")
+    if vf_hex is None:
+        raise SafetyError(f"[{source_name}] does not contain VFCurve.")
+    vf_summary = validate_vf_hex(vf_hex)
+
+    source_core_khz = _integer_value(source, "CoreClkBoost", 0)
+    source_core_mhz = source_core_khz / 1000
+    core_mhz = args.core if args.core is not None else source_core_mhz
+    validate_settings(
+        {
+            "core_mhz": core_mhz,
+            "power_percent": power,
+            "thermal_c": thermal,
+        }
+    )
+    if int(core_mhz * 1000) != core_mhz * 1000:
+        raise SafetyError("Core offset must resolve to a whole number of kHz.")
+    core_khz = int(core_mhz * 1000)
+
+    changed = text
+    profile_plans: list[dict] = []
+    writes: list[PlannedWrite] = []
+    for profile_name in selected:
+        profile_index = PROFILE_NAMES.index(profile_name)
+        memory_mhz = memory_values[profile_index]
+        fan_percent = fan_values[profile_index]
+        validate_settings(
+            {
+                "memory_mhz": memory_mhz,
+                "fan_percent": fan_percent,
+            }
+        )
+
+        block = get_section(changed, profile_name)
+        target_vf_hex = get_ini_value(block, "VFCurve")
+        if target_vf_hex is None:
+            raise SafetyError(
+                f"[{profile_name}] does not contain a reference VFCurve; "
+                "offset-only projection is not possible."
+            )
+        validate_vf_hex(target_vf_hex)
+        projected_vf_hex, projected_vf_summary = _project_effective_curve(
+            vf_hex,
+            target_vf_hex,
+        )
+        block = set_ini_value(block, "CoreClkBoost", core_khz)
+        block = set_ini_value(block, "MemClkBoost", memory_mhz * 1000)
+        block = set_ini_value(block, "PowerLimit", power)
+        block = set_ini_value(block, "ThermalLimit", thermal)
+        block = set_ini_value(block, "FanMode", 1)
+        block = set_ini_value(block, "FanSpeed", fan_percent)
+        block = set_ini_value(block, "VFCurve", projected_vf_hex)
+        changed = replace_section(changed, profile_name, block)
+
+        top_level = profiles_dir / f"{profile_name}.cfg"
+        if not top_level.is_file():
+            raise SafetyError(
+                f"Exact top-level profile target is missing: {top_level}. "
+                "Open/save that slot in Afterburner before planning an edit."
+            )
+        if top_level.is_symlink():
+            raise SafetyError(f"Refusing symlinked top-level profile: {top_level}")
+        top_original = top_level.read_bytes()
+        top_text = top_original.decode("ascii", errors="strict")
+        patched_top = patch_profile_contents(top_text)
+        writes.append(
+            PlannedWrite(
+                target=top_level,
+                data=ascii_bytes(patched_top),
+                label=f"{profile_name} activation metadata",
+                expected_before_sha256=sha256_bytes(top_original),
+            )
+        )
+        profile_plans.append(
+            {
+                "profile": profile_name,
+                "core_mhz": core_mhz,
+                "memory_mhz": memory_mhz,
+                "power_percent": power,
+                "thermal_c": thermal,
+                "fan_percent": fan_percent,
+                "vf_source": source_name,
+                "vf_curve": projected_vf_summary,
+                "vf_edit": "target offsets only",
+            }
+        )
+
+    config_bytes = ascii_bytes(changed)
+    writes.insert(
+        0,
+        PlannedWrite(
+            target=cfg_path,
+            data=config_bytes,
+            label="per-GPU profile config",
+            expected_before_sha256=sha256_bytes(config_original),
+        ),
+    )
+    plan = {
+        "schema_version": 1,
+        "mode": "execute" if args.execute else "plan",
+        "gpu_id": args.gpu_id.upper(),
+        "config": str(cfg_path),
+        "source_profile": source_name,
+        "uses_example_values": any(
+            value is None for value in (args.memory, args.fan, args.power, args.thermal)
+        ),
+        "vf_curve": vf_summary,
+        "profiles": profile_plans,
+        "targets": [
+            {
+                "label": write.label,
+                "path": str(write.target),
+                "before_sha256": write.expected_before_sha256,
+                "planned_sha256": sha256_bytes(write.data),
+                "changed": write.expected_before_sha256 != sha256_bytes(write.data),
+            }
+            for write in writes
+        ],
+    }
+    return plan, writes
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Plan a tiered Afterburner profile edit. No files are changed unless "
+            "--execute is supplied."
+        )
+    )
+    parser.add_argument("--config", required=True, help="Exact per-GPU .cfg path.")
+    parser.add_argument(
+        "--gpu-id",
+        required=True,
+        help="Exact complete GPU identity (the selected config filename stem).",
+    )
+    parser.add_argument(
+        "--source-profile",
+        choices=("Startup",) + PROFILE_NAMES,
+        default="Startup",
+        help="Exact section supplying the validated VF curve and default core offset.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        choices=PROFILE_NAMES,
+        default=None,
+        help="Exact target slot; repeat as needed. Default: Profile1..Profile5.",
+    )
+    parser.add_argument(
+        "--core",
+        type=float,
+        help="Core offset in MHz. Default: validated source-profile value.",
+    )
+    parser.add_argument(
+        "--memory",
+        nargs=5,
+        type=int,
+        default=None,
+        metavar=("P1", "P2", "P3", "P4", "P5"),
+        help=(
+            "Explicit memory offsets in MHz for Profile1..Profile5. Required "
+            "for --execute."
+        ),
+    )
+    parser.add_argument(
+        "--fan",
+        nargs=5,
+        type=int,
+        default=None,
+        metavar=("P1", "P2", "P3", "P4", "P5"),
+        help=(
+            "Explicit manual fan percentages for Profile1..Profile5. Required "
+            "for --execute."
+        ),
+    )
+    parser.add_argument(
+        "--power", type=int, help="Explicit power limit percent; required for --execute."
+    )
+    parser.add_argument(
+        "--thermal", type=int, help="Explicit thermal target C; required for --execute."
+    )
+    parser.add_argument(
+        "--acknowledge-source-profile",
+        action="store_true",
+        help=(
+            "Required for --execute: confirms the selected source VF curve and "
+            "optional copied core offset were independently reviewed."
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-afterburner-closed",
+        action="store_true",
+        help=(
+            "Required for --execute: confirms MSI Afterburner was fully exited "
+            "before the transaction."
+        ),
+    )
+    parser.add_argument(
+        "--backup-dir",
+        help="Verified backup directory. Default: <profiles>/KingAiBackups.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Perform the planned transaction. Without this flag, plan only.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.profile is None:
+        args.profile = list(PROFILE_NAMES)
+
+    try:
+        if args.execute:
+            missing = [
+                name
+                for name, value in (
+                    ("--memory", args.memory),
+                    ("--fan", args.fan),
+                    ("--power", args.power),
+                    ("--thermal", args.thermal),
+                )
+                if value is None
+            ]
+            if missing:
+                raise SafetyError(
+                    "--execute requires explicit tuning inputs: " + ", ".join(missing)
+                )
+            if not args.acknowledge_source_profile:
+                raise SafetyError(
+                    "--execute requires --acknowledge-source-profile after "
+                    "reviewing the selected source VF curve and core offset."
+                )
+            if not args.acknowledge_afterburner_closed:
+                raise SafetyError(
+                    "--execute requires --acknowledge-afterburner-closed to "
+                    "reduce application rewrite races."
+                )
+        plan, writes = build_plan(args)
+        if not args.execute:
+            if args.json:
+                print(json.dumps(plan, indent=2, sort_keys=True))
+            else:
+                heading = (
+                    "EXAMPLE PLAN ONLY - no files were modified"
+                    if plan["uses_example_values"]
+                    else "PLAN ONLY - no files were modified"
+                )
+                print(heading)
+                print(f"GPU: {plan['gpu_id']}")
+                print(f"Config: {plan['config']}")
+                for profile in plan["profiles"]:
+                    print(
+                        "{profile}: core {core_mhz:+g} MHz, memory "
+                        "{memory_mhz:+d} MHz, power {power_percent}%, "
+                        "thermal {thermal_c} C, fan {fan_percent}%".format(**profile)
+                    )
+                if plan["uses_example_values"]:
+                    print(
+                        "Example values cannot be executed; provide explicit "
+                        "--memory, --fan, --power, and --thermal."
+                    )
+                print(
+                    "Execution also requires --acknowledge-source-profile after "
+                    "independent source-curve review."
+                )
+                print("Re-run with --execute only after reviewing this plan.")
+            return 0
+
+        config = Path(plan["config"])
+        backup_dir = (
+            Path(args.backup_dir)
+            if args.backup_dir
+            else config.parent / "KingAiBackups"
+        )
+        receipts = atomic_write_transaction(writes, backup_dir=backup_dir)
+        result = dict(plan)
+        result["result"] = "applied"
+        result["receipts"] = [
+            {
+                "target": str(receipt.target),
+                "backup": str(receipt.backup) if receipt.backup else None,
+                "before_sha256": receipt.before_sha256,
+                "after_sha256": receipt.after_sha256,
+            }
+            for receipt in receipts
+        ]
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("APPLIED - all replacements and backups verified")
+            for receipt in receipts:
+                print(f"{receipt.target} -> {receipt.after_sha256}")
+        return 0
+    except (OSError, SafetyError, TransactionError, UnicodeError) as exc:
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "result": "error",
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,80 +1,19 @@
 #!/usr/bin/env python3
-"""
-Export MSI Afterburner VF curves to CSV files for sharing and analysis.
+"""Export decoded MSI Afterburner profile V/F curves to explicit CSV fields."""
 
-Reads VFCurve hex blobs from a per-GPU .cfg and writes CSV files with
-voltage, frequency, and adjustment data. Includes metadata header comments.
-
-Also supports importing CSV curves back into Afterburner hex format
-(via encode_vf_curve.py --from-csv).
-
-Compatible with NVIDIA GTX 10-series (Pascal) and newer.
-
-Usage:
-    # Export all profiles to CSV files in current directory
-    python export_csv_curve.py
-
-    # Export a specific section only
-    python export_csv_curve.py --section Startup
-
-    # Export to a specific directory
-    python export_csv_curve.py --output-dir ./curves/
-
-    # Export from a custom config
-    python export_csv_curve.py --config "path/to/gpu.cfg"
-
-    # Export only active (non-zero-adjustment) points
-    python export_csv_curve.py --active-only
-"""
+from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import os
-import struct
 import sys
 from datetime import datetime
+from pathlib import Path
+
+from profile_safety import SafetyError, resolve_config, validate_vf_hex
+from vf_curve_format import VFCurveFormatError, VFPoint, decode_vf_curve
 
 
-# ── Logging tee ─────────────────────────────────────────────────────────────
-class _Tee:
-    def __init__(self, stream, log_file):
-        self._stream = stream
-        self._log = log_file
-
-    def write(self, data):
-        self._stream.write(data)
-        self._log.write(data)
-
-    def flush(self):
-        self._stream.flush()
-        self._log.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-
-def _init_log(script_name: str):
-    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(logs_dir, f"{script_name}_{stamp}.log")
-    log_file = open(log_path, "w", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, log_file)
-    sys.stderr = _Tee(sys.__stderr__, log_file)
-    return log_path
-
-
-# ── Constants ───────────────────────────────────────────────────────────────
-AB_PROFILES_DIR = os.environ.get(
-    "AB_PROFILES_DIR",
-    os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        "MSI Afterburner", "Profiles",
-    ),
-)
-HEADER_HEX = 16
-HEX_PER_POINT = 24
 SECTIONS = ["Startup", "Profile1", "Profile2", "Profile3", "Profile4", "Profile5"]
 
 
@@ -82,27 +21,14 @@ def ts() -> str:
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 
 
-def find_config(custom_path: str | None = None) -> str:
-    if custom_path:
-        if not os.path.isfile(custom_path):
-            print(f"{ts()} ERROR: Config not found: {custom_path}", file=sys.stderr)
-            sys.exit(1)
-        return custom_path
-
-    pattern = os.path.join(AB_PROFILES_DIR, "VEN_10DE*.cfg")
-    matches = glob.glob(pattern)
-    if not matches:
-        print(f"{ts()} ERROR: No NVIDIA config found in {AB_PROFILES_DIR}", file=sys.stderr)
-        sys.exit(1)
-
-    best = max(matches, key=os.path.getsize)
-    return best
+def find_config(custom_path: str, gpu_id: str) -> str:
+    return str(resolve_config(config_path=custom_path, gpu_id=gpu_id))
 
 
 def parse_ini_sections(text: str) -> dict[str, str]:
-    sections = {}
+    sections: dict[str, str] = {}
     current = None
-    lines = []
+    lines: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
@@ -120,41 +46,23 @@ def parse_ini_sections(text: str) -> dict[str, str]:
 def get_ini_value(block: str, key: str) -> str | None:
     for line in block.splitlines():
         if line.strip().startswith(key + "="):
-            val = line.split("=", 1)[1].strip()
-            return val if val else None
+            value = line.split("=", 1)[1].strip()
+            return value if value else None
     return None
 
 
-def decode_vf_hex(hex_str: str) -> list[dict]:
-    if len(hex_str) < HEADER_HEX:
+def decode_vf_hex(hex_str: str) -> list[VFPoint]:
+    """Decode a complete blob or return an empty list for malformed input."""
+
+    try:
+        validate_vf_hex(hex_str)
+        return list(decode_vf_curve(hex_str).points)
+    except (SafetyError, VFCurveFormatError):
         return []
 
-    header_bytes = bytes.fromhex(hex_str[:HEADER_HEX])
-    _version, point_count = struct.unpack_from("<II", header_bytes)
 
-    data_hex = hex_str[HEADER_HEX:]
-    max_points = min(point_count, len(data_hex) // HEX_PER_POINT)
-
-    points = []
-    for i in range(max_points):
-        offset = i * HEX_PER_POINT
-        raw = bytes.fromhex(data_hex[offset:offset + HEX_PER_POINT])
-        adj, volt, freq = struct.unpack_from("<fff", raw)
-        points.append({
-            "index": i,
-            "adjustment": round(adj, 2),
-            "voltage": round(volt, 2),
-            "frequency": round(freq, 2),
-        })
-
-    return points
-
-
-def extract_gpu_info(cfg_path: str) -> str:
-    """Extract GPU identifier from config filename."""
-    basename = os.path.basename(cfg_path)
-    # e.g. VEN_10DE&DEV_2482&SUBSYS_40901584&REV_A1&BUS_1&DEV_0&FN_0.cfg
-    return basename.replace(".cfg", "")
+def extract_gpu_info(config_path: str) -> str:
+    return Path(config_path).stem
 
 
 def export_section(
@@ -162,69 +70,90 @@ def export_section(
     block: str,
     output_dir: str,
     gpu_info: str,
-    cfg_path: str,
+    config_path: str,
     active_only: bool = False,
+    execute: bool = False,
 ) -> bool:
-    """Export one section's VF curve to CSV. Returns True if exported."""
+    """Plan or export one section.  Return whether it contained a curve."""
+
     vf_hex = get_ini_value(block, "VFCurve")
-    if not vf_hex or len(vf_hex) < HEADER_HEX:
-        print(f"{ts()} [{section_name}] — no VF curve data, skipping")
+    if not vf_hex:
+        print(f"{ts()} [{section_name}] - no VF curve data, skipping")
         return False
 
     points = decode_vf_hex(vf_hex)
     if not points:
-        print(f"{ts()} [{section_name}] — could not decode VF curve, skipping")
+        print(f"{ts()} [{section_name}] - invalid VF curve, skipping")
         return False
 
     if active_only:
-        points = [p for p in points if abs(p["adjustment"]) > 0.01]
+        points = [point for point in points if abs(point.offset_mhz) > 0.01]
         if not points:
-            print(f"{ts()} [{section_name}] — no active adjustments (stock curve), skipping")
+            print(f"{ts()} [{section_name}] - no nonzero offsets, skipping")
             return False
 
-    # Read additional settings for metadata
     core_raw = get_ini_value(block, "CoreClkBoost")
-    mem_raw = get_ini_value(block, "MemClkBoost")
-    pwr = get_ini_value(block, "PowerLimit") or "N/A"
-    therm = get_ini_value(block, "ThermalLimit") or "N/A"
+    memory_raw = get_ini_value(block, "MemClkBoost")
+    power = get_ini_value(block, "PowerLimit") or "N/A"
+    thermal = get_ini_value(block, "ThermalLimit") or "N/A"
     fan_mode = get_ini_value(block, "FanMode") or "N/A"
-    fan_spd = get_ini_value(block, "FanSpeed") or "N/A"
+    fan_speed = get_ini_value(block, "FanSpeed") or "N/A"
 
-    core_mhz = f"{int(core_raw) / 1000:.0f}" if core_raw else "N/A"
-    mem_mhz = f"+{int(mem_raw) / 1000:.0f}" if mem_raw else "N/A"
+    core_mhz = f"{int(core_raw) / 1000:+.0f}" if core_raw else "N/A"
+    memory_mhz = f"{int(memory_raw) / 1000:+.0f}" if memory_raw else "N/A"
 
-    # Generate filename
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_section = section_name.replace(" ", "_")
-    csv_filename = f"vf_curve_{safe_section}_{stamp}.csv"
-    csv_path = os.path.join(output_dir, csv_filename)
+    filename = f"vf_curve_{safe_section}_{stamp}.csv"
+    csv_path = Path(output_dir) / filename
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        # Metadata header (comment lines)
-        f.write(f"# VF Curve Export — {section_name}\n")
-        f.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"# GPU: {gpu_info}\n")
-        f.write(f"# Config: {os.path.basename(cfg_path)}\n")
-        f.write(f"# Core offset: {core_mhz} MHz | Mem offset: {mem_mhz} MHz\n")
-        f.write(f"# Power: {pwr}% | Thermal: {therm}C | Fan: {fan_spd}% (mode={fan_mode})\n")
-        f.write(f"# Points: {len(points)}\n")
-        f.write(f"#\n")
-        f.write(f"# To import this curve back:\n")
-        f.write(f"#   python encode_vf_curve.py --from-csv {csv_filename}\n")
-        f.write(f"#   python create_profile.py --profile N --vf-curve output.hex\n")
-        f.write(f"#\n")
+    if not execute:
+        print(
+            f"{ts()} [{section_name}] PLAN ONLY -> {filename} "
+            f"({len(points)} points)"
+        )
+        return True
 
-        writer = csv.writer(f)
-        writer.writerow(["voltage_mV", "frequency_MHz", "adjustment_MHz"])
+    with csv_path.open("x", newline="", encoding="utf-8") as handle:
+        handle.write(f"# VF Curve Export - {section_name}\n")
+        handle.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        handle.write(f"# GPU: {gpu_info}\n")
+        handle.write(f"# Config: {os.path.basename(config_path)}\n")
+        handle.write(
+            f"# Core offset: {core_mhz} MHz | "
+            f"Mem offset: {memory_mhz} MHz\n"
+        )
+        handle.write(
+            f"# Power: {power}% | Thermal: {thermal}C | "
+            f"Fan: {fan_speed}% (mode={fan_mode})\n"
+        )
+        handle.write(f"# Points: {len(points)}\n")
+        handle.write("# Effective frequency = base frequency + offset.\n")
+        handle.write("# Import is plan-only unless --execute writes a hex artifact.\n")
+        handle.write("#\n")
 
-        for pt in points:
-            writer.writerow([
-                f"{pt['voltage']:.2f}",
-                f"{pt['frequency']:.2f}",
-                f"{pt['adjustment']:.2f}",
-            ])
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "index",
+                "voltage_mV",
+                "base_frequency_MHz",
+                "offset_MHz",
+                "effective_frequency_MHz",
+            ]
+        )
+        for point in points:
+            writer.writerow(
+                [
+                    point.index,
+                    f"{point.voltage_mv:.2f}",
+                    f"{point.base_frequency_mhz:.2f}",
+                    f"{point.offset_mhz:.2f}",
+                    f"{point.effective_frequency_mhz:.2f}",
+                ]
+            )
 
-    print(f"{ts()} [{section_name}] -> {csv_filename} ({len(points)} points)")
+    print(f"{ts()} [{section_name}] -> {filename} ({len(points)} points)")
     return True
 
 
@@ -232,55 +161,90 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export MSI Afterburner VF curves to CSV files."
     )
-    parser.add_argument("--config", "-c", help="Path to per-GPU .cfg file. Auto-detects if omitted.")
-    parser.add_argument("--section", "-s", default=None,
-                        help="Export only this section (e.g. Startup, Profile1). Default: all.")
-    parser.add_argument("--output-dir", "-o", default=".",
-                        help="Directory to write CSV files. Default: current directory.")
-    parser.add_argument("--active-only", "-a", action="store_true",
-                        help="Only export points with non-zero adjustments (skip stock curve points).")
+    parser.add_argument(
+        "--config",
+        "-c",
+        required=True,
+        help="Exact path to the per-GPU .cfg file.",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        required=True,
+        help="Exact complete GPU identity (the config filename stem).",
+    )
+    parser.add_argument(
+        "--section",
+        "-s",
+        default=None,
+        help="Export one section (for example Startup). Default: all.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        default=".",
+        help="Directory for CSV artifacts. Default: current directory.",
+    )
+    parser.add_argument(
+        "--active-only",
+        "-a",
+        action="store_true",
+        help="Export only points whose stored offset is nonzero.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write CSV files. Without this flag, plan only.",
+    )
     args = parser.parse_args()
 
-    log_path = _init_log("export_csv_curve")
+    try:
+        config_path = find_config(args.config, args.gpu_id)
+    except SafetyError as exc:
+        parser.error(str(exc))
+    gpu_info = extract_gpu_info(config_path)
 
-    cfg_path = find_config(args.config)
-    gpu_info = extract_gpu_info(cfg_path)
-
-    print(f"{ts()} Log file: {log_path}")
-    print(f"{ts()} Config: {os.path.basename(cfg_path)}")
+    print(f"{ts()} Config: {os.path.basename(config_path)}")
     print(f"{ts()} GPU: {gpu_info}")
     print(f"{ts()} Output dir: {os.path.abspath(args.output_dir)}")
     print()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.execute:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    with open(cfg_path, "r", encoding="ascii", errors="replace") as f:
-        text = f.read()
+    with open(config_path, encoding="ascii", errors="replace") as handle:
+        sections = parse_ini_sections(handle.read())
 
-    sections = parse_ini_sections(text)
-
-    # Determine which sections to export
-    if args.section:
-        target_sections = [args.section]
-    else:
-        target_sections = SECTIONS
-
+    target_sections = [args.section] if args.section else SECTIONS
     exported = 0
-    for sec_name in target_sections:
-        if sec_name in sections:
-            if export_section(sec_name, sections[sec_name], args.output_dir,
-                              gpu_info, cfg_path, args.active_only):
+    for section_name in target_sections:
+        if section_name in sections:
+            if export_section(
+                section_name,
+                sections[section_name],
+                args.output_dir,
+                gpu_info,
+                config_path,
+                args.active_only,
+                args.execute,
+            ):
                 exported += 1
-        else:
-            if args.section:  # Only warn if user specifically requested this section
-                print(f"{ts()} [{sec_name}] — not found in config")
+        elif args.section:
+            print(f"{ts()} [{section_name}] - not found in config")
 
     print()
-    if exported > 0:
-        print(f"{ts()} Exported {exported} curve(s) to {os.path.abspath(args.output_dir)}")
-        print(f"{ts()} Import back with: python encode_vf_curve.py --from-csv <file.csv>")
+    if exported:
+        action = "Exported" if args.execute else "Planned"
+        print(
+            f"{ts()} {action} {exported} curve(s) in "
+            f"{os.path.abspath(args.output_dir)}"
+        )
+        print(
+            f"{ts()} Import with: python encode_vf_curve.py "
+            "--config <cfg> --gpu-id <id> --from-csv <file.csv>"
+        )
     else:
-        print(f"{ts()} No curves exported. Run Afterburner first to generate baseline curves.")
+        print(f"{ts()} No valid curves found.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

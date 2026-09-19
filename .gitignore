@@ -3,6 +3,8 @@ ignore/
 
 # Python
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 *.pyc
 *.pyo
 *.egg-info/
@@ -24,9 +26,10 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
-# Tests
-test_*.py
-tests/
+# Public deterministic tests are tracked. Keep local/private captures out.
+tests/private/
+tests/output/
+tests/**/*.local.*
 
 # Logs (keep the ignore/ dir itself via plan.md)
 *.log

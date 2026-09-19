@@ -1,475 +1,524 @@
 #!/usr/bin/env python3
+"""Generate a guarded MSI Afterburner profile V/F curve.
+
+The encoder requires an existing curve as its structural reference.  It
+preserves the 12-byte header, voltage grid, base-frequency values, fixed slot
+buffer, and opaque footer.  Generation changes only the per-point offset.
+Nothing is installed into Afterburner or applied to a GPU.
 """
-Encode VF (Voltage-Frequency) curves for MSI Afterburner .cfg files.
 
-Generates a valid VFCurve hex blob from:
-  - An undervolt specification (target voltage + frequency)
-  - A flat clock offset (±MHz applied to all points)
-  - A CSV file with per-point adjustments
-
-Requires a reference VF curve (from an existing config) to copy the footer
-(contains undocumented GPU Boost thermal floor data).
-
-Compatible with NVIDIA GTX 10-series (Pascal) and newer.
-
-Usage:
-    # Undervolt: 1890 MHz locked at 850 mV, flatten above
-    python encode_vf_curve.py --undervolt 850 1890
-
-    # Flat offset: +150 MHz to all points
-    python encode_vf_curve.py --offset 150
-
-    # Import from CSV (voltage_mV, frequency_MHz, adjustment_MHz)
-    python encode_vf_curve.py --from-csv my_curve.csv
-
-    # Specify a reference config (auto-detects by default)
-    python encode_vf_curve.py --undervolt 850 1890 --config "path/to/gpu.cfg"
-
-    # Output to file instead of stdout
-    python encode_vf_curve.py --undervolt 850 1890 -o my_curve.hex
-
-    # Preview without writing (decode the generated curve)
-    python encode_vf_curve.py --undervolt 850 1890 --preview
-"""
+from __future__ import annotations
 
 import argparse
 import csv
-import glob
+import math
 import os
-import struct
-import sys
 from datetime import datetime
+from pathlib import Path
+from typing import Iterable
 
-
-# ── Logging tee ─────────────────────────────────────────────────────────────
-class _Tee:
-    """Write to both a file and the original stream."""
-    def __init__(self, stream, log_file):
-        self._stream = stream
-        self._log = log_file
-
-    def write(self, data):
-        self._stream.write(data)
-        self._log.write(data)
-
-    def flush(self):
-        self._stream.flush()
-        self._log.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-
-def _init_log(script_name: str):
-    """Set up file logging. Returns the log file path."""
-    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(logs_dir, f"{script_name}_{stamp}.log")
-    log_file = open(log_path, "w", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, log_file)
-    sys.stderr = _Tee(sys.__stderr__, log_file)
-    return log_path
-
-
-# ── Constants ───────────────────────────────────────────────────────────────
-AB_PROFILES_DIR = os.environ.get(
-    "AB_PROFILES_DIR",
-    os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        "MSI Afterburner", "Profiles",
-    ),
+from profile_safety import (
+    PlannedWrite,
+    SafetyError,
+    atomic_write_transaction,
+    resolve_config,
+    sha256_bytes,
+    validate_bound,
+    validate_vf_hex,
 )
-HEADER_BYTES = 8           # uint32 version + uint32 count
-BYTES_PER_POINT = 12       # 3 x float32
-HEX_PER_POINT = 24         # 12 bytes * 2
-HEADER_HEX = 16            # 8 bytes * 2
-TOTAL_SLOTS = 256          # Fixed buffer size (including empty padding)
+from vf_curve_format import (
+    VFCurve,
+    VFCurveFormatError,
+    VFPoint,
+    decode_vf_curve,
+    encode_vf_curve,
+)
 
-# Default VF curve grid (Pascal → Ampere → Ada: 127 points, 450–1237.5 mV, 6.25 mV steps)
-DEFAULT_POINT_COUNT = 127
-VOLTAGE_START_MV = 450.0
-VOLTAGE_STEP_MV = 6.25
+
+SECTIONS = ("Startup", "Profile1", "Profile2", "Profile3", "Profile4", "Profile5")
 
 
 def ts() -> str:
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 
 
-def find_config(custom_path: str | None = None) -> str:
-    """Find a GPU config file to use as footer reference."""
-    if custom_path:
-        if not os.path.isfile(custom_path):
-            print(f"{ts()} ERROR: Config not found: {custom_path}", file=sys.stderr)
-            sys.exit(1)
-        return custom_path
+def find_config(custom_path: str, gpu_id: str) -> str:
+    """Resolve one exact reference config and verify its GPU identity."""
 
-    pattern = os.path.join(AB_PROFILES_DIR, "VEN_10DE*.cfg")
-    matches = glob.glob(pattern)
-    if not matches:
-        print(f"{ts()} ERROR: No NVIDIA config found in {AB_PROFILES_DIR}", file=sys.stderr)
-        print(f"{ts()} A reference config is needed for the VF curve footer.", file=sys.stderr)
-        sys.exit(1)
-
-    best = max(matches, key=os.path.getsize)
-    return best
+    return str(resolve_config(config_path=custom_path, gpu_id=gpu_id))
 
 
 def get_ini_value(text: str, section: str, key: str) -> str | None:
-    """Get a value from a specific section in INI text."""
+    """Get a value from one exact INI section."""
+
     in_section = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             in_section = stripped[1:-1] == section
         elif in_section and stripped.startswith(key + "="):
-            val = stripped.split("=", 1)[1].strip()
-            return val if val else None
+            value = stripped.split("=", 1)[1].strip()
+            return value if value else None
     return None
 
 
-# ── Decode helpers (shared with decode_vf_curve.py) ─────────────────────────
-def decode_vf_hex(hex_str: str) -> tuple[list[dict], int, str]:
-    """
-    Decode a VFCurve hex string.
+def get_reference_data(
+    config_path: str,
+    requested_section: str | None = None,
+) -> tuple[VFCurve, str, str]:
+    """Load and validate a reference curve without probing other files."""
 
-    Returns:
-        points: list of {index, adjustment, voltage, frequency} dicts
-        point_count: number of active points from header
-        footer_hex: the footer portion of the hex string (everything after 256 slots)
-    """
-    if len(hex_str) < HEADER_HEX:
-        return [], 0, ""
+    with open(config_path, encoding="ascii", errors="replace") as handle:
+        text = handle.read()
 
-    header_bytes = bytes.fromhex(hex_str[:HEADER_HEX])
-    _version, point_count = struct.unpack_from("<II", header_bytes)
+    sections: Iterable[str]
+    if requested_section is not None:
+        if requested_section not in SECTIONS:
+            raise SafetyError(
+                "--section must be Startup or Profile1 through Profile5."
+            )
+        sections = (requested_section,)
+    else:
+        sections = SECTIONS
 
-    data_start = HEADER_HEX
-    data_end = data_start + TOTAL_SLOTS * HEX_PER_POINT
-    footer_hex = hex_str[data_end:] if len(hex_str) > data_end else ""
-
-    data_hex = hex_str[data_start:]
-    max_points = min(point_count, len(data_hex) // HEX_PER_POINT)
-
-    points = []
-    for i in range(max_points):
-        offset = i * HEX_PER_POINT
-        raw = bytes.fromhex(data_hex[offset:offset + HEX_PER_POINT])
-        adj, volt, freq = struct.unpack_from("<fff", raw)
-        points.append({
-            "index": i,
-            "adjustment": round(adj, 2),
-            "voltage": round(volt, 2),
-            "frequency": round(freq, 2),
-        })
-
-    return points, point_count, footer_hex
-
-
-def encode_vf_hex(points: list[dict], point_count: int, footer_hex: str) -> str:
-    """
-    Encode VF curve points into a hex string for Afterburner .cfg.
-
-    Args:
-        points: list of {adjustment, voltage, frequency} dicts (only active points)
-        point_count: number stored in header (should match len(points))
-        footer_hex: hex string copied verbatim from reference curve
-
-    Returns:
-        Complete VFCurve hex string ready for .cfg file
-    """
-    # Header: version=0x20000, point_count
-    # Version is 0x20000 (131072) NOT 2 — verified from real Afterburner configs
-    header = struct.pack("<II", 0x20000, point_count)
-
-    # Active points
-    point_data = b""
-    for pt in points:
-        point_data += struct.pack("<fff", pt["adjustment"], pt["voltage"], pt["frequency"])
-
-    # Pad to 256 slots with zero bytes
-    empty_count = TOTAL_SLOTS - len(points)
-    padding = b"\x00" * (empty_count * BYTES_PER_POINT)
-
-    # Combine
-    full_binary = header + point_data + padding
-    # Afterburner uses UPPERCASE hex in configs — match for byte-identical roundtrips
-    hex_str = full_binary.hex().upper()
-
-    # Append footer verbatim (preserves original case)
-    if footer_hex:
-        hex_str += footer_hex
-
-    return hex_str
-
-
-def get_reference_data(cfg_path: str) -> tuple[list[dict], int, str]:
-    """
-    Read the [Startup] VF curve from a config as reference.
-
-    Returns:
-        points: decoded reference points
-        point_count: from header
-        footer_hex: the footer to preserve
-    """
-    with open(cfg_path, "r", encoding="ascii", errors="replace") as f:
-        text = f.read()
-
-    # Try Startup first, then Profile1..5
-    for section in ["Startup", "Profile1", "Profile2", "Profile3", "Profile4", "Profile5"]:
+    for section in sections:
         vf_hex = get_ini_value(text, section, "VFCurve")
-        if vf_hex and len(vf_hex) > HEADER_HEX:
-            points, point_count, footer_hex = decode_vf_hex(vf_hex)
-            if points:
-                print(f"{ts()} Reference curve from [{section}]: {len(points)} points, "
-                      f"footer: {len(footer_hex)} hex chars")
-                return points, point_count, footer_hex
+        if not vf_hex:
+            continue
+        validate_vf_hex(vf_hex)
+        try:
+            curve = decode_vf_curve(vf_hex)
+        except VFCurveFormatError as exc:
+            raise SafetyError(str(exc)) from exc
+        print(
+            f"{ts()} Reference curve from [{section}]: "
+            f"{curve.point_count} points, footer: {len(curve.footer)} bytes"
+        )
+        return curve, vf_hex, section
 
-    print(f"{ts()} ERROR: No valid VFCurve found in any section of {cfg_path}", file=sys.stderr)
-    print(f"{ts()} Run Afterburner at least once so it generates a baseline curve.", file=sys.stderr)
-    sys.exit(1)
+    scope = f"[{requested_section}]" if requested_section else "known profile sections"
+    raise SafetyError(
+        f"No valid VFCurve found in {scope} of {config_path}. "
+        "Save a baseline curve in Afterburner first."
+    )
 
-
-# ── Curve generation modes ──────────────────────────────────────────────────
 
 def make_undervolt_curve(
-    ref_points: list[dict],
+    reference_points: Iterable[VFPoint],
     target_voltage_mv: float,
-    target_freq_mhz: float,
-) -> list[dict]:
+    target_effective_frequency_mhz: float,
+) -> list[VFPoint]:
+    """Flatten effective frequency at and above one reference voltage."""
+
+    generated = []
+    for point in reference_points:
+        offset = point.offset_mhz
+        if point.voltage_mv >= target_voltage_mv:
+            offset = target_effective_frequency_mhz - point.base_frequency_mhz
+        generated.append(
+            VFPoint(
+                index=point.index,
+                voltage_mv=point.voltage_mv,
+                base_frequency_mhz=point.base_frequency_mhz,
+                offset_mhz=offset,
+            )
+        )
+    return generated
+
+
+def make_offset_curve(
+    reference_points: Iterable[VFPoint],
+    offset_delta_mhz: float,
+) -> list[VFPoint]:
+    """Add one delta to each stored offset while preserving base values."""
+
+    return [
+        VFPoint(
+            index=point.index,
+            voltage_mv=point.voltage_mv,
+            base_frequency_mhz=point.base_frequency_mhz,
+            offset_mhz=point.offset_mhz + offset_delta_mhz,
+        )
+        for point in reference_points
+    ]
+
+
+def _normalized_fieldnames(fieldnames: list[str] | None) -> list[str]:
+    if not fieldnames:
+        raise SafetyError("CSV is missing a header row.")
+    return [name.strip().lower().replace(" ", "_") for name in fieldnames]
+
+
+def _field(row: dict[str, str | None], *names: str) -> str | None:
+    for name in names:
+        value = row.get(name)
+        if value is not None and value.strip() != "":
+            return value.strip()
+    return None
+
+
+def _finite_float(value: str, label: str, row_number: int) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise SafetyError(f"CSV row {row_number}: {label} must be numeric.") from exc
+    if not math.isfinite(parsed):
+        raise SafetyError(f"CSV row {row_number}: {label} must be finite.")
+    return parsed
+
+
+def load_csv_curve(
+    csv_path: str,
+    reference_points: Iterable[VFPoint],
+) -> list[VFPoint]:
+    """Import offsets/effective values while preserving voltage and base fields.
+
+    Canonical columns are ``voltage_mV``, ``base_frequency_MHz``,
+    ``offset_MHz``, and ``effective_frequency_MHz``.  The older
+    ``adjustment_MHz`` name is accepted as an offset alias.  The older
+    ``frequency_MHz`` name is accepted as an effective-frequency alias because
+    it can be checked against the immutable reference base.
     """
-    Create an undervolt curve: set target frequency at target voltage,
-    flatten all points above to the same frequency.
 
-    Points below the target voltage keep their original frequencies.
-    The adjustment field is calculated as (new_freq - original_freq).
-    """
-    new_points = []
-    for pt in ref_points:
-        new_pt = dict(pt)
+    path = Path(csv_path)
+    if not path.is_file():
+        raise SafetyError(f"CSV file not found: {path}")
 
-        if pt["voltage"] >= target_voltage_mv:
-            # At or above target: flatten to target frequency
-            new_pt["frequency"] = target_freq_mhz
-            new_pt["adjustment"] = round(target_freq_mhz - pt["frequency"] + pt["adjustment"], 2)
-        # Below target: keep original
+    reference = tuple(reference_points)
+    by_voltage = {round(point.voltage_mv, 2): point for point in reference}
+    replacements: dict[float, VFPoint] = {}
 
-        new_points.append(new_pt)
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        data_lines = (
+            line
+            for line in handle
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        reader = csv.DictReader(data_lines)
+        reader.fieldnames = _normalized_fieldnames(reader.fieldnames)
 
-    return new_points
+        for row_number, row in enumerate(reader, start=2):
+            voltage_text = _field(row, "voltage_mv", "voltage")
+            if voltage_text is None:
+                raise SafetyError(f"CSV row {row_number}: voltage_mV is required.")
+            voltage = _finite_float(voltage_text, "voltage_mV", row_number)
+            reference_point = by_voltage.get(round(voltage, 2))
+            if reference_point is None or abs(reference_point.voltage_mv - voltage) > 0.01:
+                raise SafetyError(
+                    f"CSV row {row_number}: voltage {voltage} mV does not "
+                    "match the selected reference grid."
+                )
+            voltage_key = round(reference_point.voltage_mv, 2)
+            if voltage_key in replacements:
+                raise SafetyError(
+                    f"CSV row {row_number}: duplicate voltage {voltage} mV."
+                )
+
+            index_text = _field(row, "index")
+            if index_text is not None:
+                index = _finite_float(index_text, "index", row_number)
+                if not index.is_integer() or int(index) != reference_point.index:
+                    raise SafetyError(
+                        f"CSV row {row_number}: index does not match reference "
+                        f"slot {reference_point.index}."
+                    )
+
+            base_text = _field(
+                row,
+                "base_frequency_mhz",
+                "base_mhz",
+                "base_frequency",
+                "base",
+            )
+            if base_text is not None:
+                base = _finite_float(base_text, "base_frequency_MHz", row_number)
+                if abs(base - reference_point.base_frequency_mhz) > 0.01:
+                    raise SafetyError(
+                        f"CSV row {row_number}: base frequency is immutable; "
+                        f"expected {reference_point.base_frequency_mhz} MHz."
+                    )
+
+            offset_text = _field(
+                row,
+                "offset_mhz",
+                "adjustment_mhz",
+                "offset",
+                "adjustment",
+            )
+            effective_text = _field(
+                row,
+                "effective_frequency_mhz",
+                "effective_mhz",
+                "effective_frequency",
+                "frequency_mhz",
+                "frequency",
+            )
+            if offset_text is None and effective_text is None:
+                raise SafetyError(
+                    f"CSV row {row_number}: provide offset_MHz or "
+                    "effective_frequency_MHz."
+                )
+
+            offset = None
+            if offset_text is not None:
+                offset = _finite_float(offset_text, "offset_MHz", row_number)
+                validate_bound("vf_adjustment_mhz", offset)
+
+            if effective_text is not None:
+                effective = _finite_float(
+                    effective_text,
+                    "effective_frequency_MHz",
+                    row_number,
+                )
+                validate_bound("vf_frequency_mhz", effective)
+                derived_offset = effective - reference_point.base_frequency_mhz
+                validate_bound("vf_adjustment_mhz", derived_offset)
+                if offset is not None and abs(offset - derived_offset) > 0.05:
+                    raise SafetyError(
+                        f"CSV row {row_number}: offset and effective frequency "
+                        "disagree with the reference base."
+                    )
+                offset = derived_offset
+
+            assert offset is not None
+            replacements[voltage_key] = VFPoint(
+                index=reference_point.index,
+                voltage_mv=reference_point.voltage_mv,
+                base_frequency_mhz=reference_point.base_frequency_mhz,
+                offset_mhz=offset,
+            )
+
+    if not replacements:
+        raise SafetyError("CSV contains no curve rows.")
+
+    print(
+        f"{ts()} CSV: {len(replacements)} entries matched "
+        f"{len(reference)} reference points"
+    )
+    return [
+        replacements.get(round(point.voltage_mv, 2), point)
+        for point in reference
+    ]
 
 
-def make_offset_curve(ref_points: list[dict], offset_mhz: float) -> list[dict]:
-    """
-    Create a flat offset curve: shift every point by ±offset_mhz.
-    """
-    new_points = []
-    for pt in ref_points:
-        new_pt = dict(pt)
-        new_pt["adjustment"] = round(pt["adjustment"] + offset_mhz, 2)
-        new_pt["frequency"] = round(pt["frequency"] + offset_mhz, 2)
-        new_points.append(new_pt)
-    return new_points
+def preview_curve(points: Iterable[VFPoint], label: str = "Generated") -> None:
+    """Print effective-frequency inflections without inferring user intent."""
 
+    selected = tuple(points)
+    print(f"{ts()} === {label} Curve ({len(selected)} points) ===")
+    print(
+        f"{ts()}   {'Idx':>5}  {'Voltage':>10}  {'Base':>10}  "
+        f"{'Offset':>10}  {'Effective':>10}"
+    )
 
-def load_csv_curve(csv_path: str, ref_points: list[dict]) -> list[dict]:
-    """
-    Load a VF curve from CSV. Expected columns: voltage_mV, frequency_MHz, adjustment_MHz
-
-    If adjustment_MHz is omitted, it defaults to 0 for matching voltages
-    or is calculated as (csv_freq - ref_freq) for known reference points.
-    """
-    if not os.path.isfile(csv_path):
-        print(f"{ts()} ERROR: CSV file not found: {csv_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # Build a lookup from reference points: voltage → (freq, adj)
-    ref_lookup = {}
-    for pt in ref_points:
-        ref_lookup[round(pt["voltage"], 2)] = (pt["frequency"], pt["adjustment"])
-
-    csv_points = {}
-    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-
-        # Normalize column names (strip whitespace, lowercase)
-        if reader.fieldnames:
-            reader.fieldnames = [n.strip().lower().replace(" ", "_") for n in reader.fieldnames]
-
-        for row in reader:
-            # Skip comment rows
-            first_val = list(row.values())[0] if row else ""
-            if first_val and first_val.strip().startswith("#"):
-                continue
-
-            voltage = float(row.get("voltage_mv") or row.get("voltage", 0))
-            frequency = float(row.get("frequency_mhz") or row.get("frequency", 0))
-            adj_str = row.get("adjustment_mhz") or row.get("adjustment", "")
-
-            if adj_str.strip():
-                adjustment = float(adj_str)
-            else:
-                # Calculate from reference if available
-                ref_data = ref_lookup.get(round(voltage, 2))
-                if ref_data:
-                    adjustment = round(frequency - ref_data[0] + ref_data[1], 2)
-                else:
-                    adjustment = 0.0
-
-            csv_points[round(voltage, 2)] = {
-                "voltage": round(voltage, 2),
-                "frequency": round(frequency, 2),
-                "adjustment": round(adjustment, 2),
-            }
-
-    # Merge CSV points into reference curve (CSV overrides matching voltages)
-    new_points = []
-    for pt in ref_points:
-        v = round(pt["voltage"], 2)
-        if v in csv_points:
-            new_pt = dict(pt)
-            new_pt["voltage"] = csv_points[v]["voltage"]
-            new_pt["frequency"] = csv_points[v]["frequency"]
-            new_pt["adjustment"] = csv_points[v]["adjustment"]
-            new_points.append(new_pt)
-        else:
-            new_points.append(dict(pt))
-
-    csv_used = sum(1 for pt in ref_points if round(pt["voltage"], 2) in csv_points)
-    print(f"{ts()} CSV: {len(csv_points)} entries, {csv_used} matched reference voltage points")
-
-    return new_points
-
-
-def preview_curve(points: list[dict], label: str = "Generated") -> None:
-    """Print a human-readable preview of the curve (inflection points only)."""
-    print(f"{ts()} === {label} Curve ({len(points)} points) ===")
-    print(f"{ts()}   {'Idx':>5}  {'Voltage':>10}  {'Frequency':>10}  {'Adjustment':>10}")
-    print(f"{ts()}   {'-----':>5}  {'-------':>10}  {'---------':>10}  {'----------':>10}")
-
-    prev_freq = -1.0
-    for pt in points:
-        is_inflection = abs(pt["frequency"] - prev_freq) > 0.5
-        is_edge = pt["index"] == 0 or pt["index"] >= len(points) - 2
+    previous_effective = None
+    for point in selected:
+        effective = point.effective_frequency_mhz
+        is_inflection = (
+            previous_effective is None
+            or abs(effective - previous_effective) > 0.5
+        )
+        is_edge = point.index == 0 or point.index >= len(selected) - 2
         if is_inflection or is_edge:
-            print(f"{ts()}   [{pt['index']:>3}]  {pt['voltage']:>8.1f} mV  "
-                  f"{pt['frequency']:>8.1f} MHz  (adj: {pt['adjustment']:>7.1f})")
-        prev_freq = pt["frequency"]
+            print(
+                f"{ts()}   [{point.index:>3}]  "
+                f"{point.voltage_mv:>8.1f} mV  "
+                f"{point.base_frequency_mhz:>8.1f} MHz  "
+                f"{point.offset_mhz:>+8.1f} MHz  "
+                f"{effective:>8.1f} MHz"
+            )
+        previous_effective = effective
 
-    voltages = [p["voltage"] for p in points]
-    freqs = [p["frequency"] for p in points]
+    voltages = [point.voltage_mv for point in selected]
+    effective_frequencies = [
+        point.effective_frequency_mhz for point in selected
+    ]
     print()
-    print(f"{ts()}   Range: {min(voltages):.1f}–{max(voltages):.1f} mV | Peak: {max(freqs):.1f} MHz")
+    print(
+        f"{ts()}   Range: {min(voltages):.1f}-{max(voltages):.1f} mV | "
+        f"Peak effective: {max(effective_frequencies):.1f} MHz"
+    )
     print()
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Encode VF curves for MSI Afterburner .cfg files."
     )
-
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
-        "--undervolt", "-u",
-        nargs=2, metavar=("VOLTAGE_MV", "FREQ_MHZ"), type=float,
-        help="Create undervolt curve: lock at VOLTAGE_MV with FREQ_MHZ, flatten above."
+        "--undervolt",
+        "-u",
+        nargs=2,
+        metavar=("VOLTAGE_MV", "EFFECTIVE_FREQ_MHZ"),
+        type=float,
+        help=(
+            "Set the effective frequency at VOLTAGE_MV and flatten all higher "
+            "voltage points to it."
+        ),
     )
     mode.add_argument(
-        "--offset", "-f",
-        type=float, metavar="MHZ",
-        help="Flat clock offset applied to all points (positive=OC, negative=downclock)."
+        "--offset",
+        "-f",
+        type=float,
+        metavar="MHZ",
+        help="Add a flat delta to every stored per-point offset.",
     )
     mode.add_argument(
-        "--from-csv", "-i",
+        "--from-csv",
+        "-i",
         metavar="CSV_PATH",
-        help="Import curve from CSV file (columns: voltage_mV, frequency_MHz[, adjustment_MHz])."
+        help=(
+            "Import offsets/effective frequencies from CSV; voltage and base "
+            "must match the reference."
+        ),
     )
 
     parser.add_argument(
-        "--config", "-c",
-        help="Path to reference .cfg file. Auto-detects from Afterburner Profiles if omitted."
+        "--config",
+        "-c",
+        required=True,
+        help="Exact path to the reference per-GPU .cfg file.",
     )
     parser.add_argument(
-        "--section", "-s",
+        "--gpu-id",
+        required=True,
+        help="Exact complete GPU identity (the config filename stem).",
+    )
+    parser.add_argument(
+        "--section",
+        "-s",
         default="Startup",
-        help="Config section to use as reference (default: Startup)."
+        help="Exact reference section (default: Startup).",
     )
     parser.add_argument(
-        "--output", "-o",
-        help="Write hex blob to file instead of stdout."
+        "--output",
+        "-o",
+        help="Write a hex artifact instead of printing it.",
     )
     parser.add_argument(
-        "--preview", "-p",
+        "--preview",
+        "-p",
         action="store_true",
-        help="Print a human-readable table of the generated curve."
+        help="Print a human-readable generated-curve table.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write --output. Without this flag an output request is plan-only.",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        help="Verified backup directory for an existing output file.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing an existing --output (also requires --execute).",
     )
     args = parser.parse_args()
+    if args.overwrite and not args.output:
+        parser.error("--overwrite requires --output.")
 
-    log_path = _init_log("encode_vf_curve")
+    try:
+        config_path = find_config(args.config, args.gpu_id)
+        reference, reference_hex, _section = get_reference_data(
+            config_path,
+            args.section,
+        )
+    except SafetyError as exc:
+        parser.error(str(exc))
 
-    # Get reference curve
-    cfg_path = find_config(args.config)
-    print(f"{ts()} Log file: {log_path}")
-    print(f"{ts()} Reference config: {os.path.basename(cfg_path)}")
+    print(f"{ts()} Reference config: {os.path.basename(config_path)}")
     print()
 
-    ref_points, point_count, footer_hex = get_reference_data(cfg_path)
-
-    # Generate the new curve
-    if args.undervolt:
-        target_v, target_f = args.undervolt
-        print(f"{ts()} Mode: Undervolt — lock at {target_v:.1f} mV / {target_f:.0f} MHz")
-        new_points = make_undervolt_curve(ref_points, target_v, target_f)
-    elif args.offset is not None:
-        print(f"{ts()} Mode: Flat offset — {args.offset:+.0f} MHz to all points")
-        new_points = make_offset_curve(ref_points, args.offset)
-    elif args.from_csv:
-        print(f"{ts()} Mode: CSV import — {args.from_csv}")
-        new_points = load_csv_curve(args.from_csv, ref_points)
-    else:
-        # Should be unreachable due to required=True
-        parser.error("Specify --undervolt, --offset, or --from-csv")
-        return
-
-    # Encode to hex
-    hex_blob = encode_vf_hex(new_points, point_count, footer_hex)
-
-    print(f"{ts()} Generated VFCurve: {len(hex_blob)} hex chars "
-          f"({len(hex_blob) // 2} bytes)")
-    print()
-
-    # Verify roundtrip
-    rt_points, rt_count, rt_footer = decode_vf_hex(hex_blob)
-    if len(rt_points) != len(new_points):
-        print(f"{ts()} WARNING: Roundtrip mismatch — encoded {len(new_points)} "
-              f"but decoded {len(rt_points)} points", file=sys.stderr)
-    else:
-        mismatches = 0
-        for orig, rt in zip(new_points, rt_points):
-            if abs(orig["voltage"] - rt["voltage"]) > 0.01 or \
-               abs(orig["frequency"] - rt["frequency"]) > 0.5:
-                mismatches += 1
-        if mismatches:
-            print(f"{ts()} WARNING: {mismatches} points differ after roundtrip!", file=sys.stderr)
+    try:
+        if args.undervolt:
+            target_voltage, target_effective = args.undervolt
+            validate_bound("vf_voltage_mv", target_voltage)
+            validate_bound("vf_frequency_mhz", target_effective)
+            matching_voltage = next(
+                (
+                    point.voltage_mv
+                    for point in reference.points
+                    if abs(point.voltage_mv - target_voltage) <= 0.01
+                ),
+                None,
+            )
+            if matching_voltage is None:
+                raise SafetyError(
+                    "--undervolt voltage must exactly match a voltage point in "
+                    "the selected reference curve."
+                )
+            generated = make_undervolt_curve(
+                reference.points,
+                matching_voltage,
+                target_effective,
+            )
+            print(
+                f"{ts()} Mode: effective-frequency plateau at "
+                f"{matching_voltage:.1f} mV / {target_effective:.0f} MHz"
+            )
+        elif args.offset is not None:
+            validate_bound("vf_adjustment_mhz", args.offset)
+            generated = make_offset_curve(reference.points, args.offset)
+            print(f"{ts()} Mode: add {args.offset:+.0f} MHz to all offsets")
         else:
-            print(f"{ts()} Roundtrip verification: OK ({len(rt_points)} points match)")
+            generated = load_csv_curve(args.from_csv, reference.points)
+            print(f"{ts()} Mode: CSV import - {args.from_csv}")
 
-    # Preview
+        blob = encode_vf_curve(reference, generated)
+        validate_vf_hex(blob, reference_hex=reference_hex)
+        decoded = decode_vf_curve(blob)
+    except (SafetyError, VFCurveFormatError) as exc:
+        parser.error(str(exc))
+
+    # Exact byte re-encoding catches header or point-field shifts before output.
+    if encode_vf_curve(decoded, decoded.points) != blob:
+        parser.error("Generated curve failed exact byte-roundtrip verification.")
+    print(
+        f"{ts()} Generated VFCurve: {len(blob)} hex chars "
+        f"({len(blob) // 2} bytes)"
+    )
+    print(f"{ts()} Roundtrip verification: OK ({len(generated)} points match)")
+
     if args.preview:
         print()
-        preview_curve(new_points, "Generated")
+        preview_curve(generated)
 
-    # Output
     if args.output:
-        with open(args.output, "w", encoding="ascii") as f:
-            f.write(hex_blob)
-        print(f"{ts()} Written to: {args.output}")
+        output = Path(args.output).expanduser().resolve(strict=False)
+        original = output.read_bytes() if output.exists() else None
+        if original is not None and not args.overwrite:
+            parser.error(
+                f"Output already exists: {output}. Use --overwrite with "
+                "--execute only after reviewing the replacement."
+            )
+        if not args.execute:
+            print(f"{ts()} PLAN ONLY - would write validated hex to: {output}")
+            print(f"{ts()} Re-run with --execute after reviewing the curve.")
+        else:
+            backup_dir = (
+                Path(args.backup_dir)
+                if args.backup_dir
+                else output.parent / "KingAiBackups"
+            )
+            atomic_write_transaction(
+                [
+                    PlannedWrite(
+                        output,
+                        blob.encode("ascii"),
+                        "VF hex export",
+                        sha256_bytes(original) if original is not None else None,
+                    )
+                ],
+                backup_dir=backup_dir,
+            )
+            print(f"{ts()} Written and verified: {output}")
     else:
-        # Print hex blob to stdout (can be piped to create_profile.py)
         print()
-        print(f"{ts()} === VFCurve Hex (copy this into .cfg or pass to create_profile.py) ===")
-        print(hex_blob)
+        print(f"{ts()} === VFCurve Hex ===")
+        print(blob)
 
     print()
     print(f"{ts()} Done.")

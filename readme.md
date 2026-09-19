@@ -1,266 +1,337 @@
-# MSI Afterburner Overclocker Tools
+# KingAi MSI Afterburner Profile Tools
 
-Command-line tools for reading and writing MSI Afterburner GPU profiles.  
-Decode voltage-frequency (VF) curves, apply tiered overclock/undervolt profiles, and automate config management — all from the terminal.
+Command-line tools for inspecting and carefully editing MSI Afterburner
+profile files, plus a passive live-state logger.
 
-**Compatible with NVIDIA GeForce GTX 10-series (Pascal) and newer:** GTX 1070, 1080, 1080 Ti, RTX 2060–2080 Ti, RTX 3060–3090 Ti, RTX 4060–4090, RTX 5070–5090.
+See [CHANGELOG.md](CHANGELOG.md) for the defects corrected by the current
+unreleased safety batch.
 
-> Works with any GPU that MSI Afterburner supports via per-point VF curve editing (GPU Boost 3.0+). This includes all NVIDIA cards from Pascal (2016) onward that expose voltage-frequency curves through Afterburner's config files.
+The profile tools are offline: they do **not** talk to a GPU, Afterburner's
+shared memory, NVAPI, or a driver. The separate logger opens Afterburner's
+SDK-documented named mappings with read-only access; it has no control command,
+writer, notification, injection, or process-hook path. No profile writer
+changes a file unless the user supplies `--execute` (Python) or `-Execute`
+(PowerShell).
 
----
+## Safety model
 
-## What These Tools Do
+The write path now enforces all of the following:
 
-### `decode_vf_curve` — Read & Display VF Curves
+- plan-only behavior by default;
+- an exact full GPU identity and exact config path;
+- exact `Profile1` through `Profile5` targets;
+- no directory scan, largest-file selection, or multi-GPU guessing;
+- software guardrails for every supported clock, power, thermal, fan, and VF
+  input;
+- complete VF header, point-count, finite-number, range, and voltage-order
+  validation;
+- bounded effective-frequency dips, full 256-slot buffer, and
+  reference-bound voltage/base/unused-slot/footer validation;
+- same-directory temporary files and atomic `os.replace` operations;
+- SHA-256 verification of temporary files, backups, and final targets;
+- rollback of already replaced files if any later replacement fails;
+- no automatic UAC prompt or hidden elevation.
 
-Parses the binary VF curve data stored in MSI Afterburner's `.cfg` profile files and displays it in a human-readable table. Shows every voltage-frequency point, the per-point clock adjustment, and summary statistics.
+The guardrails reject clearly unintended inputs. They do **not** prove that a
+setting is stable or safe for a particular card. Stability still requires
+incremental workload testing, temperature monitoring, and error checking.
 
-```
-$ python scripts/decode_vf_curve.py
+## Requirements
 
-[2026-02-12 18:30:01] Reading config: VEN_10DE&DEV_2482&...cfg
-[2026-02-12 18:30:01] === Startup ===
-[2026-02-12 18:30:01]   Core: 0 MHz | Mem: +0 MHz | Fan: 68% (manual)
-[2026-02-12 18:30:01]   VF Curve (127 points, 12 bytes/point):
-[2026-02-12 18:30:01]     [  0]    450.0 mV     250.0 MHz  (adj:    0.0)
-[2026-02-12 18:30:01]     [ 72]    900.0 mV    1679.0 MHz  (adj: -205.0)  <-- undervolt clamp
-[2026-02-12 18:30:01]     [126]   1237.5 mV    2050.0 MHz  (adj: -205.0)
-[2026-02-12 18:30:01]   Range: 450.0–1237.5 mV | Peak: 2050.0 MHz
-```
+- Python 3.10 or newer
+- Windows PowerShell 5.1 or newer for the `.ps1` wrappers
+- an MSI Afterburner profile already saved for the intended GPU and slot
 
-### `apply_profiles` — Write Tiered OC Profiles
+No third-party Python package is required.
 
-Copies a validated VF curve (e.g. your Startup undervolt) to all 5 profile slots and sets per-profile memory OC + fan speed. Writes to a temp file first, then copies to Program Files with admin elevation.
+## Identify the exact target
 
-```
-$ python scripts/apply_profiles.py --dry-run
+The GPU identity is the complete filename stem, not just `VEN_10DE&DEV_0000`.
+For example:
 
-[2026-02-12 18:31:00] DRY RUN — no files will be modified
-[2026-02-12 18:31:00] Profile1 → Core: 0 | Mem: +500 MHz | Fan: 50% | VF: Startup curve
-[2026-02-12 18:31:00] Profile2 → Core: 0 | Mem: +600 MHz | Fan: 55% | VF: Startup curve
-[2026-02-12 18:31:00] Profile3 → Core: 0 | Mem: +700 MHz | Fan: 60% | VF: Startup curve
-[2026-02-12 18:31:00] Profile4 → Core: 0 | Mem: +800 MHz | Fan: 70% | VF: Startup curve
-[2026-02-12 18:31:00] Profile5 → Core: 0 | Mem: +900 MHz | Fan: 80% | VF: Startup curve
-```
-
----
-
-## How It Works
-
-### The VF Curve Format
-
-MSI Afterburner stores GPU voltage-frequency curves as hex-encoded binary data in its per-GPU `.cfg` files. The format:
-
-| Section | Size | Description |
-|---------|------|-------------|
-| **Header** | 8 bytes (16 hex chars) | `uint32 version` (always 2) + `uint32 point_count` (typically 127) |
-| **Points** | 12 bytes each (24 hex chars) | 3 x `float32` per point (see below) |
-| **Empty slots** | 12 bytes each | Zero-padded to 256 total slots |
-| **Footer** | Variable | Fan curve data and metadata |
-
-Each 12-byte VF point contains three IEEE 754 single-precision floats:
-
-| Offset | Type | Field | Example |
-|--------|------|-------|---------|
-| 0–3 | float32 | **Clock adjustment** (MHz) | `-205.0` (matches CoreClkBoost / 1000) |
-| 4–7 | float32 | **Voltage** (mV) | `900.0` (X-axis of the curve) |
-| 8–11 | float32 | **Frequency** (MHz) | `1845.0` (Y-axis — the clock at that voltage) |
-
-The 127 voltage points span **450 mV to 1237.5 mV** in **6.25 mV steps**.
-
-### What the VF Curve Controls
-
-NVIDIA GPUs since Pascal (GTX 10-series, 2016) use **GPU Boost 3.0/4.0** — an automatic clock management system that adjusts GPU frequency based on temperature, power draw, and voltage.
-
-The VF curve tells the GPU: *"at this voltage, run at this frequency."*
-
-- **Stock curve**: Higher voltages map to higher clocks, up to the GPU's max boost
-- **Undervolt**: Flatten the curve at a target voltage — the GPU hits your desired frequency at lower voltage, reducing heat and power
-- **Overclock**: Shift the curve upward — higher frequencies at each voltage point
-
-When you drag points in MSI Afterburner's Ctrl+F curve editor, it modifies exactly these float values in the config file. These tools let you do the same thing from scripts.
-
-### GPU Boost Generations
-
-| Generation | Architecture | Cards | Key Feature |
-|-----------|-------------|-------|-------------|
-| **GPU Boost 3.0** | Pascal (2016) | GTX 1070, 1080, 1080 Ti, Titan X/Xp | Per-point VF curve editing via Afterburner |
-| **GPU Boost 4.0** | Turing (2018) | RTX 2060–2080 Ti, GTX 1650–1660 Ti | No hard temp limit, configurable thermal plateau, OC Scanner |
-| **GPU Boost 4.0** | Ampere (2020) | RTX 3060–3090 Ti | Same VF format, higher power limits |
-| **GPU Boost 4.0** | Ada Lovelace (2022) | RTX 4060–4090 | Same VF format, higher clocks |
-| **GPU Boost 5.0** | Blackwell (2025) | RTX 5070–5090 | Same per-point VF curve format in Afterburner |
-
-The VF curve binary format has remained consistent across all these generations. The tools work with any card that Afterburner recognizes and creates a `VEN_10DE*.cfg` file for.
-
-### Config File Layout
-
-The per-GPU config file (e.g. `VEN_10DE&DEV_2482&SUBSYS_40901458&REV_A1&BUS_1&DEV_0&FN_0.cfg`) uses INI-style sections:
-
-```ini
-[Defaults]          # Factory defaults (reference only)
-[Settings]          # Capture flags
-[Startup]           # Applied on Afterburner launch (your "daily driver")
-[Profile1]          # Slot 1 — activated by clicking "1" in Afterburner
-[Profile2]          # Slot 2
-[Profile3]          # Slot 3
-[Profile4]          # Slot 4
-[Profile5]          # Slot 5
-[PreSuspendedMode]  # Saved state before sleep/hibernate
+```text
+VEN_10DE&DEV_0000&SUBSYS_00000000&REV_00&BUS_0&DEV_0&FN_0
 ```
 
-Each profile section contains:
+The matching config must be:
 
-| Key | Unit | Description |
-|-----|------|-------------|
-| `CoreClkBoost` | kHz (divide by 1000 for MHz) | Global core clock offset |
-| `MemClkBoost` | kHz (divide by 1000 for MHz) | Memory clock offset |
-| `CoreVoltageBoost` | mV | Voltage offset (usually 0 with VF curves) |
-| `PowerLimit` | % | Power limit (100 = stock TDP) |
-| `ThermalLimit` | deg C | Temperature target |
-| `FanMode` | 0 or 1 | 0 = auto, 1 = manual fixed speed |
-| `FanSpeed` | % | Fan speed percentage (only when FanMode=1) |
-| `VFCurve` | hex string | The full voltage-frequency curve (binary, hex-encoded) |
-
----
-
-## Available Scripts
-
-Every tool has **Python**, **PowerShell**, and **Batch** versions. All produce timestamped terminal output.
-
-| Script | Python | PowerShell | Batch |
-|--------|--------|------------|-------|
-| Decode VF curves | `decode_vf_curve.py` | `decode_vf_curve.ps1` | `decode_vf_curve.bat` |
-| Apply tiered profiles | `apply_profiles.py` | `apply_profiles.ps1` | `apply_profiles.bat` |
-
-### Usage
-
-```bash
-# Python (requires Python 3.8+, no pip dependencies)
-python scripts/decode_vf_curve.py
-python scripts/decode_vf_curve.py --config "path/to/custom.cfg"
-python scripts/apply_profiles.py --dry-run
-python scripts/apply_profiles.py
-
-# PowerShell
-.\scripts\decode_vf_curve.ps1
-.\scripts\apply_profiles.ps1
-
-# Batch (wraps the PowerShell scripts)
-scripts\decode_vf_curve.bat
-scripts\apply_profiles.bat
+```text
+VEN_10DE&DEV_0000&SUBSYS_00000000&REV_00&BUS_0&DEV_0&FN_0.cfg
 ```
 
-All scripts auto-detect your GPU config by scanning `C:\Program Files (x86)\MSI Afterburner\Profiles\` for `VEN_10DE*.cfg` files.
+The CLI refuses a mismatch. It never chooses one of several GPU configs.
 
----
+## Read a VF curve
 
-## Installation
+Python:
 
-1. **Clone the repo**:
-   ```bash
-   git clone https://github.com/KingAiCodeForge/KingAi_MSi_afterburner_overclocker_tools.git
-   cd KingAi_MSi_afterburner_overclocker_tools
-   ```
-
-2. **Requirements**:
-   - Windows 10/11
-   - MSI Afterburner installed (tested with v4.6.4+)
-   - Python 3.8+ (for `.py` scripts) — stdlib only, no pip installs needed
-   - PowerShell 5.1+ (built into Windows)
-
-3. **Run any script** from the `scripts/` folder.
-
----
-
-## Understanding Your VF Curve Output
-
-A typical decoded undervolt curve looks like this:
-
-```
-Point  Voltage     Frequency   What's happening
------  -------     ---------   ----------------
-[  0]  450.0 mV    250.0 MHz   Idle — minimum voltage and clock
-[ 40]  700.0 mV   1105.0 MHz   Mid-range — clock scaling up with voltage
-[ 71]  893.8 mV   1990.0 MHz   Just below your undervolt target
-[ 72]  900.0 mV   1679.0 MHz   ← UNDERVOLT CLAMP: freq drops here
-[ 73]  906.2 mV   2035.0 MHz   Above the clamp (GPU never reaches these)
-[126] 1237.5 mV   2050.0 MHz   Maximum voltage point (never reached)
+```powershell
+$gpu = "VEN_10DE&DEV_0000&SUBSYS_00000000&REV_00&BUS_0&DEV_0&FN_0"
+$cfg = "C:\Program Files (x86)\MSI Afterburner\Profiles\$gpu.cfg"
+python .\scripts\decode_vf_curve.py --config $cfg --gpu-id $gpu
 ```
 
-**The "clamp" at point 72** is where an undervolt works. By setting a **lower frequency at a specific voltage**, you tell GPU Boost: *"don't go above 900 mV."* The GPU sees that increasing voltage would **decrease** performance, so it stays at or below your chosen voltage.
+Windows PowerShell 5.1 wrapper:
 
-Points above the clamp are technically present in the curve but the GPU has no incentive to use them — boosting to a higher voltage would mean running at a *lower* clock. GPU Boost always picks the highest-performing voltage/frequency combination.
-
----
-
-## Disclaimer
-
-**This software modifies MSI Afterburner configuration files that directly control your GPU's voltage, clock speeds, and fan behavior.**
-
-### What Can Go Wrong
-
-- **Unstable overclocks** cause driver crashes, application freezes, and blue screens (BSOD). Your system will recover after a reboot, but unsaved work is lost.
-- **Excessive voltage or frequency** can degrade GPU silicon over extended periods. Stock voltage limits in Afterburner are set conservatively by NVIDIA, but sustained operation at maximum allowed voltage under heavy load accelerates electromigration.
-- **Aggressive memory overclocks** can cause **silent data corruption** — texture glitches, flickering, or incorrect compute results — before producing an obvious crash. Always test with memory-specific benchmarks (OCCT VRAM test, HWiNFO memory error counters) not just GPU stress tests.
-- **Disabling or reducing fan speed** while overclocking removes your thermal safety margin. If the GPU hits its thermal limit, it will throttle aggressively or shut down to protect itself, but sustained high temperatures reduce component lifespan.
-
-### Safety Nets
-
-- **Afterburner's hardware limits still apply.** These tools cannot set voltages, clocks, or power limits beyond what Afterburner and your GPU's VBIOS allow. The VF curve values are clamped by the driver.
-- **Nothing is permanent.** GPU settings reset every reboot. The `.cfg` file just tells Afterburner what to apply on startup. Delete it and Afterburner regenerates stock defaults.
-- **Recovery is simple.** Close Afterburner, delete the `VEN_10DE*.cfg` file from the Profiles folder, restart Afterburner. Done.
-
-### The Silicon Lottery
-
-Every GPU die is unique. Two identical-model cards from the same production batch can have different stable voltage and frequency limits. This is a fundamental property of semiconductor manufacturing (process variation). **What runs stable on one card may crash on another.** Start conservative, test with stress tools, and increase incrementally.
-
-### Warranty
-
-Overclocking may void your GPU manufacturer's warranty. NVIDIA's reference warranty excludes damage from overclocking. Check your specific card manufacturer's (ASUS, MSI, EVGA, Gigabyte, etc.) warranty terms — some are more lenient than others.
-
-**You use these tools entirely at your own risk. The authors accept no responsibility for any hardware damage, data loss, system instability, or other consequences resulting from the use of this software.**
-
----
-
-## How to Recover from a Bad Config
-
-If Afterburner won't load correctly or your GPU is unstable:
-
-1. **Close MSI Afterburner** completely (check system tray — right-click, Exit)
-2. Navigate to `C:\Program Files (x86)\MSI Afterburner\Profiles\`
-3. **Delete** the `VEN_10DE&DEV_XXXX&....cfg` file for your GPU
-4. Restart MSI Afterburner — it creates a fresh config with stock defaults
-
-Your GPU resets to stock clocks every power cycle. The config file only controls what Afterburner applies when it launches. No irreversible changes are made to hardware.
-
----
-
-## Project Structure
-
-```
-KingAi_MSi_afterburner_overclocker_tools/
-├── scripts/
-│   ├── decode_vf_curve.py       # Python — decode & display VF curves
-│   ├── decode_vf_curve.ps1      # PowerShell version
-│   ├── decode_vf_curve.bat      # Batch wrapper
-│   ├── apply_profiles.py        # Python — apply tiered OC profiles
-│   ├── apply_profiles.ps1       # PowerShell version
-│   └── apply_profiles.bat       # Batch wrapper
-├── ignore/                      # Local test outputs (gitignored)
-│   ├── plan.md
-│   ├── outputs/
-│   └── tests/
-├── .gitignore
-├── LICENSE
-└── README.md
+```powershell
+.\scripts\decode_vf_curve.ps1 -ConfigPath $cfg -GpuId $gpu
+.\scripts\decode_vf_curve.ps1 -ConfigPath $cfg -GpuId $gpu -ShowAll
 ```
 
----
+This is read-only and does not create a log unless the caller redirects its
+output.
 
-## Contributing
+## Log live state read-only
 
-PRs welcome. If you have a different NVIDIA GPU and can verify the VF curve format, open an issue with your `decode_vf_curve.py` output so we can confirm compatibility across GPU generations.
+The passive shared-memory CLI can capture machine-readable monitoring data or
+inspect current control/VF state without changing it:
+
+```powershell
+python .\scripts\shared_memory_cli.py capabilities
+python .\scripts\shared_memory_cli.py monitor --gpu-id $gpu --format json
+python .\scripts\shared_memory_cli.py control-state --gpu-id $gpu --format json
+```
+
+Stdout is the default. Its own `--output` option is plan-only unless
+`--execute` is also present; in that command, `--execute` authorizes only the
+log-file write, never a GPU or Afterburner control write. See
+[SHARED_MEMORY_CLI.md](SHARED_MEMORY_CLI.md) for filtering, JSONL/CSV capture,
+units, and error behavior.
+
+## Plan and apply profile tiers
+
+With no tuning arguments, the command prints this non-executable example:
+
+| Slot | Memory offset | Manual fan |
+| --- | ---: | ---: |
+| Profile1 | 0 MHz | 50% |
+| Profile2 | 0 MHz | 55% |
+| Profile3 | 0 MHz | 60% |
+| Profile4 | 0 MHz | 65% |
+| Profile5 | 0 MHz | 70% |
+
+The plan projects the validated source effective-frequency curve onto each
+target's existing voltage grid by changing only its offset floats. It preserves
+the target header, voltage/base fields, unused slots, and footer. Unless
+`--core` is supplied, it also copies the source core offset. These source values
+may themselves be unstable.
+Execution therefore requires explicit memory, fan, power, and thermal inputs
+plus `--acknowledge-source-profile`. Exit MSI Afterburner first and supply
+`--acknowledge-afterburner-closed`; the acknowledgement is a deliberate
+safety gate, not automatic process detection.
+
+Plan only:
+
+```powershell
+python .\scripts\apply_profiles.py --config $cfg --gpu-id $gpu
+```
+
+An illustrative execute command with no memory overclock is shown below. The
+numbers are not a card-specific recommendation; replace them with values
+independently validated for the exact GPU:
+
+```powershell
+python .\scripts\apply_profiles.py `
+  --config $cfg --gpu-id $gpu `
+  --memory 0 0 0 0 0 `
+  --fan 50 55 60 65 70 `
+  --power 100 --thermal 83 `
+  --acknowledge-source-profile `
+  --acknowledge-afterburner-closed `
+  --execute
+```
+
+PowerShell equivalents:
+
+```powershell
+.\scripts\apply_profiles.ps1 -ConfigPath $cfg -GpuId $gpu
+.\scripts\apply_profiles.ps1 `
+  -ConfigPath $cfg -GpuId $gpu `
+  -Memory 0,0,0,0,0 `
+  -Fan 50,55,60,65,70 `
+  -Power 100 -Thermal 83 `
+  -AcknowledgeSourceProfile `
+  -AcknowledgeAfterburnerClosed `
+  -Execute
+```
+
+Use repeated `--profile ProfileN` arguments to target fewer slots. Use
+`--memory P1 P2 P3 P4 P5`, `--fan P1 P2 P3 P4 P5`, `--core`, `--power`, and
+`--thermal` to customize the plan. Implicit example values cannot be executed.
+
+## Plan and edit one exact slot
+
+```powershell
+python .\scripts\create_profile.py `
+  --config $cfg `
+  --gpu-id $gpu `
+  --profile 1 `
+  --core 80 `
+  --mem 700 `
+  --power 100 `
+  --thermal 83 `
+  --fan 60 `
+  --copy-startup-vf
+```
+
+That command only prints a plan. Exit MSI Afterburner, add
+`--acknowledge-afterburner-closed`, and then add `--execute` to perform the
+verified transaction.
+
+## Guardrails
+
+These are input-validation limits, not recommended overclocks:
+
+| Input | Accepted range |
+| --- | ---: |
+| Core offset | -500 to +500 MHz |
+| Memory offset | -2000 to +2000 MHz |
+| Power limit | 50 to 120% |
+| Thermal target | 60 to 90 C |
+| Manual fan | 20 to 100% |
+| VF point voltage | 400 to 1300 mV |
+| VF point frequency | 100 to 4000 MHz |
+| VF point adjustment | -1000 to +1000 MHz |
+| VF point count | 1 to 256 |
+
+Actual firmware and driver limits can be narrower. Passing validation does not
+mean a value is stable.
+
+## Curve generation and CSV export
+
+Both file-output tools are also plan-only by default:
+
+```powershell
+python .\scripts\encode_vf_curve.py `
+  --config $cfg --gpu-id $gpu `
+  --undervolt 850 1800 `
+  --preview `
+  --output .\curve.hex
+
+python .\scripts\export_csv_curve.py `
+  --config $cfg --gpu-id $gpu `
+  --section Startup `
+  --output-dir .\curve_exports
+```
+
+Add `--execute` to create the requested output. Generating a curve or CSV does
+not install or apply it. Replacing an existing hex output additionally
+requires `--overwrite`.
+
+## Backups and recovery
+
+Before changing an existing target, the transaction writes and verifies a
+timestamped SHA-256-labelled `.bak`. The default directory is
+`KingAiBackups` next to the selected config; `--backup-dir` can select another
+location.
+
+If a transaction fails, files already replaced in that transaction are
+restored and verified. If a later manual recovery is needed:
+
+1. Exit MSI Afterburner.
+2. Identify the backup whose hash and timestamp match the intended session.
+3. Preserve the current files separately.
+4. Restore the per-GPU config and corresponding top-level `ProfileN.cfg`
+   backups while elevated.
+5. Verify hashes, then start Afterburner without automatic profile application.
+
+Do not assume deleting a config is sufficient recovery, and do not restore a
+backup belonging to a different GPU identity.
+
+## VF format status
+
+The parser handles the observed 12-byte little-endian
+version/count/reserved header followed by 256 12-byte slots containing
+voltage, base-frequency, and offset `float32` values. Effective frequency is
+base plus offset. The current validator requires the observed `0x20000`
+version, strictly increasing active-point voltage, bounded effective-frequency
+dips, the complete 256-slot buffer, and a bounded footer. A replacement must
+match the selected config's point count, voltage grid, base-frequency fields,
+reserved header, unused-slot bytes, total length, and footer; only offset
+floats may change. Undervolt targets must match an existing reference voltage
+point.
+
+This is an observed profile-data layout, not a public MSI compatibility
+contract. Curve versions, point layouts, and trailing data can vary.
+Unsupported or implausible input is rejected instead of being silently
+rewritten.
+
+The repository does not claim blanket compatibility with every Pascal,
+Turing, Ampere, Ada, or Blackwell card. A new GPU/Afterburner combination
+needs read-only decoding and fixture validation before write support is
+claimed.
+
+## Tests
+
+The public tests use synthetic profile fixtures only:
+
+```powershell
+python -m compileall -q scripts tests
+python -m unittest discover -s tests -v
+# Optional equivalent when pytest is installed. pytest.ini limits collection
+# to the public synthetic tests directory.
+python -m pytest -q
+```
+
+They cover:
+
+- exact GPU/profile identity and refusal to guess;
+- plan-only hash preservation;
+- all numeric guardrails and malformed VF curves;
+- exact VF header/base/voltage/unused/footer preservation and offset-only
+  projection;
+- explicit execution against temporary fixtures;
+- backup hash/content verification;
+- injected atomic-replace failure and rollback;
+- bounds-checked synthetic shared-memory layouts and clean JSON/JSONL/CSV;
+- Windows PowerShell 5.1 parser validation.
+
+The test suite never reads or writes the installed MSI Afterburner directory.
+The included GitHub Actions workflow is configured to run the Python suite on
+multiple versions and the PowerShell parser checks on Windows. Until that
+workflow is committed and pushed, those checks have only been run locally.
+
+## Known limitations
+
+- MSI Afterburner must be exited before an execute operation. The CLI requires
+  an explicit acknowledgement because it cannot enforce process shutdown or
+  lock every Afterburner version.
+- Each target hash is checked against the plan before replacement and checked
+  again immediately before its atomic replace. A detected external edit aborts
+  the transaction instead of being overwritten.
+- A replacement of one file is atomic, but Windows cannot make replacement of
+  the per-GPU file and several `ProfileN.cfg` files one filesystem-wide atomic
+  operation. Backups are prepared first and normal failures roll back; a power
+  loss or process termination between replacements can still require manual
+  recovery.
+- The tests prove file-handling behavior against synthetic fixtures. They do
+  not certify a physical GPU, overclock, undervolt, driver, or Afterburner
+  release.
+- The current VF validator accepts the observed `0x20000` format only.
+
+## Project layout
+
+```text
+scripts/
+  profile_safety.py       shared validation and transaction layer
+  vf_curve_format.py      observed profile V/F codec
+  decode_vf_curve.py      read-only decoder
+  decode_vf_curve.ps1     PowerShell 5.1 read-only wrapper
+  apply_profiles.py       tiered profile planner/writer
+  apply_profiles.ps1      PowerShell 5.1 plan/execute wrapper
+  create_profile.py       one-slot planner/writer
+  encode_vf_curve.py      guarded curve generator
+  export_csv_curve.py     guarded CSV exporter
+  afterburner_shared_memory.py  read-only SDK mapping parser
+  shared_memory_cli.py    passive live-state logger
+tests/
+  fixtures/               synthetic configs only
+  test_profile_safety.py
+  test_powershell_syntax.py
+  test_vf_curve_format.py
+  test_shared_memory.py
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
