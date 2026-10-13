@@ -370,25 +370,34 @@ def set_ini_value(block: str, key: str, value: str | int) -> str:
 
 
 def patch_profile_contents(text: str) -> str:
-    pattern = re.compile(r"(?m)^ProfileContents=\d+[ \t]*(\r?)$")
-    if pattern.search(text):
-        return pattern.sub(
-            lambda match: "ProfileContents=3" + match.group(1),
-            text,
-            count=1,
+    """Update [Settings] only, rejecting ambiguous headers and duplicate keys.
+
+    Preserve every byte outside the exact target key/insertion, including
+    unrelated sections, separators and Windows CRLF line endings.
+    """
+    headings = list(re.finditer(r"(?m)^\[([^\]\r\n]+)\][ \t]*(\r?\n|$)", text))
+    matches = [index for index, match in enumerate(headings)
+               if match.group(1) == "Settings"]
+    if len(matches) != 1:
+        raise SafetyError(
+            f"Expected one [Settings] section, found {len(matches)}."
         )
-    header = re.search(r"(?m)^\[Settings\][ \t]*(\r?\n|$)", text)
-    if not header:
-        raise SafetyError("Top-level profile is missing [Settings].")
-    newline = "\r\n" if header.group(1) == "\r\n" or "\r\n" in text else "\n"
-    prefix = "" if header.group(1) else newline
-    return (
-        text[: header.end()]
-        + prefix
-        + "ProfileContents=3"
-        + newline
-        + text[header.end() :]
-    )
+    section_index = matches[0]
+    header = headings[section_index]
+    begin = header.end()
+    end = (headings[section_index + 1].start()
+           if section_index + 1 < len(headings) else len(text))
+    body = text[begin:end]
+    if re.search(r"(?im)^ProfileContents[ \t]+=[^\r\n]*$", body):
+        raise SafetyError("Malformed ProfileContents key in [Settings].")
+    current = get_ini_value(body, "ProfileContents")
+    if current is not None:
+        amended = set_ini_value(body, "ProfileContents", 3)
+    else:
+        newline = "\r\n" if header.group(2) == "\r\n" else "\n"
+        separator = "" if header.group(2) else newline
+        amended = separator + "ProfileContents=3" + newline + body
+    return text[:begin] + amended + text[end:]
 
 
 def ascii_bytes(text: str) -> bytes:
