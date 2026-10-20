@@ -376,6 +376,13 @@ def patch_profile_contents(text: str) -> str:
     unrelated sections, separators and Windows CRLF line endings.
     """
     headings = list(re.finditer(r"(?m)^\[([^\]\r\n]+)\][ \t]*(\r?\n|$)", text))
+    recognized = {match.start() for match in headings}
+    for candidate in re.finditer(r"(?m)^[ \t]*\[[^\r\n]*", text):
+        if candidate.start() not in recognized:
+            raise SafetyError("Unsupported section heading; profile left unchanged.")
+    if any(match.group(1).strip().casefold() == "settings"
+           and match.group(1) != "Settings" for match in headings):
+        raise SafetyError("Noncanonical [Settings] section; profile left unchanged.")
     matches = [index for index, match in enumerate(headings)
                if match.group(1) == "Settings"]
     if len(matches) != 1:
@@ -388,8 +395,9 @@ def patch_profile_contents(text: str) -> str:
     end = (headings[section_index + 1].start()
            if section_index + 1 < len(headings) else len(text))
     body = text[begin:end]
-    if re.search(r"(?im)^ProfileContents[ \t]+=[^\r\n]*$", body):
-        raise SafetyError("Malformed ProfileContents key in [Settings].")
+    for key in re.finditer(r"(?im)^[ \t]*ProfileContents[ \t]*=", body):
+        if key.group() != "ProfileContents=":
+            raise SafetyError("Malformed ProfileContents key in [Settings].")
     current = get_ini_value(body, "ProfileContents")
     if current is not None:
         amended = set_ini_value(body, "ProfileContents", 3)
@@ -417,6 +425,16 @@ def sha256_file(path: os.PathLike[str] | str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def reject_output_alias(output: Path, inputs: Iterable[Path]) -> None:
+    """Refuse resolved-path and hard-link aliases before planning any export."""
+
+    for source in inputs:
+        if output.resolve(strict=False) == source.resolve(strict=False) or (
+            output.exists() and source.exists() and output.samefile(source)
+        ):
+            raise SafetyError(f"Output aliases an input file: {source}")
 
 
 def _write_temp(target: Path, data: bytes) -> Path:

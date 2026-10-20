@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 - 2026-10-20
+
+- Scope ProfileContents updates to one canonical Settings section; reject duplicate or ambiguous headings and key spellings, preserving unrelated bytes and CRLF.
+- Refuse hex-output aliases of the reference config or imported CSV, including hard links, even when overwrite is requested.
+- Report file/encoding errors without tracebacks and fail PowerShell wrappers when Python is missing.
+- Include scoped regressions in stdlib unittest discovery and add outside-checkout, spaces/non-ASCII, alias and missing-input checks.
+- Exclude local real profiles and backups while explicitly retaining labelled synthetic examples.
+- Qualify offline file handling only; see RELEASE_AUDIT.md and release receipts for current tests, original commits, artifact hashes, and unsupported live/hardware paths.
+
+## Earlier safety work (included)
 
 This safety release corrects defects in the currently published tools; it is
 not a claim that any clock or voltage setting is stable on a physical GPU.

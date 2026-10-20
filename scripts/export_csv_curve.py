@@ -114,6 +114,7 @@ def export_section(
         )
         return True
 
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("x", newline="", encoding="utf-8") as handle:
         handle.write(f"# VF Curve Export - {section_name}\n")
         handle.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -176,6 +177,7 @@ def main() -> None:
         "--section",
         "-s",
         default=None,
+        choices=SECTIONS,
         help="Export one section (for example Startup). Default: all.",
     )
     parser.add_argument(
@@ -208,10 +210,7 @@ def main() -> None:
     print(f"{ts()} Output dir: {os.path.abspath(args.output_dir)}")
     print()
 
-    if args.execute:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-
-    with open(config_path, encoding="ascii", errors="replace") as handle:
+    with open(config_path, encoding="ascii", errors="strict") as handle:
         sections = parse_ini_sections(handle.read())
 
     target_sections = [args.section] if args.section else SECTIONS
@@ -248,4 +247,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise SystemExit(f"ERROR: {exc}") from None

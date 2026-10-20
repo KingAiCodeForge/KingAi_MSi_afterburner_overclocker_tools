@@ -34,3 +34,10 @@ tests/**/*.local.*
 # Logs (keep the ignore/ dir itself via plan.md)
 *.log
 logs/
+
+# Real profiles and verified recovery copies are local data.
+KingAiBackups/
+*.bak
+*.cfg
+# Only these user-owned synthetic public fixtures are reusable examples.
+!tests/fixtures/profiles/*.cfg

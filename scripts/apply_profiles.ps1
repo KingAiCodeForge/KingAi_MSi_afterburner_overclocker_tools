@@ -106,5 +106,11 @@ if ($Json) {
     $arguments.Add("--json")
 }
 
-& $PythonCommand @arguments
-exit $LASTEXITCODE
+try {
+    $null = Get-Command -Name $PythonCommand -ErrorAction Stop
+    & $PythonCommand @arguments
+    exit $LASTEXITCODE
+} catch {
+    Write-Error -Message "Unable to run Python command '$PythonCommand': $_" -ErrorAction Continue
+    exit 2
+}

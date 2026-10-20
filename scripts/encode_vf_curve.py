@@ -20,8 +20,10 @@ from typing import Iterable
 from profile_safety import (
     PlannedWrite,
     SafetyError,
+    TransactionError,
     atomic_write_transaction,
     resolve_config,
+    reject_output_alias,
     sha256_bytes,
     validate_bound,
     validate_vf_hex,
@@ -68,7 +70,7 @@ def get_reference_data(
 ) -> tuple[VFCurve, str, str]:
     """Load and validate a reference curve without probing other files."""
 
-    with open(config_path, encoding="ascii", errors="replace") as handle:
+    with open(config_path, encoding="ascii", errors="strict") as handle:
         text = handle.read()
 
     sections: Iterable[str]
@@ -419,14 +421,21 @@ def main() -> None:
     args = parser.parse_args()
     if args.overwrite and not args.output:
         parser.error("--overwrite requires --output.")
+    if args.execute and not args.output:
+        parser.error("--execute requires --output.")
 
     try:
         config_path = find_config(args.config, args.gpu_id)
+        if args.output:
+            protected = [Path(config_path)]
+            if args.from_csv:
+                protected.append(Path(args.from_csv))
+            reject_output_alias(Path(args.output).expanduser(), protected)
         reference, reference_hex, _section = get_reference_data(
             config_path,
             args.section,
         )
-    except SafetyError as exc:
+    except (SafetyError, OSError, UnicodeError) as exc:
         parser.error(str(exc))
 
     print(f"{ts()} Reference config: {os.path.basename(config_path)}")
@@ -470,7 +479,7 @@ def main() -> None:
         blob = encode_vf_curve(reference, generated)
         validate_vf_hex(blob, reference_hex=reference_hex)
         decoded = decode_vf_curve(blob)
-    except (SafetyError, VFCurveFormatError) as exc:
+    except (SafetyError, VFCurveFormatError, OSError, UnicodeError, csv.Error) as exc:
         parser.error(str(exc))
 
     # Exact byte re-encoding catches header or point-field shifts before output.
@@ -525,4 +534,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, UnicodeError, SafetyError, TransactionError) as exc:
+        raise SystemExit(f"ERROR: {exc}") from None
