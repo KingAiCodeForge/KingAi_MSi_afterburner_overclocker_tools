@@ -4,7 +4,7 @@ Command-line tools for inspecting and carefully editing MSI Afterburner
 profile files, plus a passive live-state logger.
 
 See [CHANGELOG.md](CHANGELOG.md) for the defects corrected by the current
-unreleased safety batch.
+v0.1.0 offline safety release. See [RELEASE_AUDIT.md](RELEASE_AUDIT.md) for the per-script qualification and source-preservation record.
 
 The profile tools are offline: they do **not** talk to a GPU, Afterburner's
 shared memory, NVAPI, or a driver. The separate logger opens Afterburner's
@@ -288,8 +288,7 @@ They cover:
 
 The test suite never reads or writes the installed MSI Afterburner directory.
 The included GitHub Actions workflow is configured to run the Python suite on
-multiple versions and the PowerShell parser checks on Windows. Until that
-workflow is committed and pushed, those checks have only been run locally.
+multiple versions and the PowerShell parser checks on Windows. The release notes link the fresh remote workflow results. Hardware access and physical stability remain outside this qualification.
 
 ## Known limitations
 

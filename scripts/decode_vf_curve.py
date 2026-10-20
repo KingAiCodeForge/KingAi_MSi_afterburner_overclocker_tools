@@ -189,7 +189,7 @@ def main() -> None:
     print(f"{ts()} Full path: {config_path}")
     print()
 
-    with open(config_path, encoding="ascii", errors="replace") as handle:
+    with open(config_path, encoding="ascii", errors="strict") as handle:
         text = handle.read()
 
     sections = parse_ini_sections(text)
@@ -202,4 +202,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise SystemExit(f"ERROR: {exc}") from None

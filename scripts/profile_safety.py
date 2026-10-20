@@ -370,25 +370,42 @@ def set_ini_value(block: str, key: str, value: str | int) -> str:
 
 
 def patch_profile_contents(text: str) -> str:
-    pattern = re.compile(r"(?m)^ProfileContents=\d+[ \t]*(\r?)$")
-    if pattern.search(text):
-        return pattern.sub(
-            lambda match: "ProfileContents=3" + match.group(1),
-            text,
-            count=1,
+    """Update [Settings] only, rejecting ambiguous headers and duplicate keys.
+
+    Preserve every byte outside the exact target key/insertion, including
+    unrelated sections, separators and Windows CRLF line endings.
+    """
+    headings = list(re.finditer(r"(?m)^\[([^\]\r\n]+)\][ \t]*(\r?\n|$)", text))
+    recognized = {match.start() for match in headings}
+    for candidate in re.finditer(r"(?m)^[ \t]*\[[^\r\n]*", text):
+        if candidate.start() not in recognized:
+            raise SafetyError("Unsupported section heading; profile left unchanged.")
+    if any(match.group(1).strip().casefold() == "settings"
+           and match.group(1) != "Settings" for match in headings):
+        raise SafetyError("Noncanonical [Settings] section; profile left unchanged.")
+    matches = [index for index, match in enumerate(headings)
+               if match.group(1) == "Settings"]
+    if len(matches) != 1:
+        raise SafetyError(
+            f"Expected one [Settings] section, found {len(matches)}."
         )
-    header = re.search(r"(?m)^\[Settings\][ \t]*(\r?\n|$)", text)
-    if not header:
-        raise SafetyError("Top-level profile is missing [Settings].")
-    newline = "\r\n" if header.group(1) == "\r\n" or "\r\n" in text else "\n"
-    prefix = "" if header.group(1) else newline
-    return (
-        text[: header.end()]
-        + prefix
-        + "ProfileContents=3"
-        + newline
-        + text[header.end() :]
-    )
+    section_index = matches[0]
+    header = headings[section_index]
+    begin = header.end()
+    end = (headings[section_index + 1].start()
+           if section_index + 1 < len(headings) else len(text))
+    body = text[begin:end]
+    for key in re.finditer(r"(?im)^[ \t]*ProfileContents[ \t]*=", body):
+        if key.group() != "ProfileContents=":
+            raise SafetyError("Malformed ProfileContents key in [Settings].")
+    current = get_ini_value(body, "ProfileContents")
+    if current is not None:
+        amended = set_ini_value(body, "ProfileContents", 3)
+    else:
+        newline = "\r\n" if header.group(2) == "\r\n" else "\n"
+        separator = "" if header.group(2) else newline
+        amended = separator + "ProfileContents=3" + newline + body
+    return text[:begin] + amended + text[end:]
 
 
 def ascii_bytes(text: str) -> bytes:
@@ -408,6 +425,16 @@ def sha256_file(path: os.PathLike[str] | str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def reject_output_alias(output: Path, inputs: Iterable[Path]) -> None:
+    """Refuse resolved-path and hard-link aliases before planning any export."""
+
+    for source in inputs:
+        if output.resolve(strict=False) == source.resolve(strict=False) or (
+            output.exists() and source.exists() and output.samefile(source)
+        ):
+            raise SafetyError(f"Output aliases an input file: {source}")
 
 
 def _write_temp(target: Path, data: bytes) -> Path:
